@@ -1,0 +1,330 @@
+/**
+ * ============================================================
+ * il2cpp_resolver.h — IL2CPP 运行时桥接层
+ * ============================================================
+ * 负责动态解析 GameAssembly.dll 导出的全部 IL2CPP 函数 
+ * 并封装为类型安全的 C++ 接口 
+ *
+ * 解析的函数分为以下几组
+ * 
+ * ·域/程序集/镜像：domain, assemblies, image
+ * ·线程管理：attach, detach
+ * ·类操作：查找、名称、父类、方法/字段枚举
+ * ·方法操作：查找、名称、参数、返回值、标志
+ * ·字段操作：查找、名称、类型、偏移、读写
+ * ·运行时调用：创建对象、调用方法、触发静态构造
+ * ·字符串：创建、读取
+ * ·装箱/拆箱：box, unbox
+ * ·类型信息：枚举值、类型名、Type 对象
+ * ·数组：创建、长度
+ * ·GC：查找存活对象（通过 Unity FindObjectsOfType）
+ *
+ * 缓存策略
+ * 
+ * ·Image 在 Init 时全量缓存（避免重复查询产生临时对象）
+ * ·Class 按需缓存（std::map<pair<ns,name>, Il2CppClass*>）
+ * ·所有缓存操作通过 mutex 保护 线程安全
+ *
+ * 仅针对 Windows x64 不做任何跨平台适配 
+ * ============================================================
+ */
+#pragma once
+#include "common.h"
+
+
+class Il2CppResolver
+{
+public:
+    // 单例
+    static Il2CppResolver& Instance();
+
+    // 生命周期
+    // 初始化：解析导出函数、获取 domain、attach 线程、缓存 image
+    BridgeResult Init();
+
+    // 关闭：清空缓存、detach 线程、清空函数指针
+    void Shutdown();
+
+    // 获取 Il2CppResolver 类的基础字段
+    bool IsInitialized() const { return m_initialized; }
+    int GetImageCount() const { return static_cast<int>(m_imageCache.size()); }
+    Il2CppDomain* GetDomain() const { return m_domain; }
+    bool IsNoFailedFunctions() const { return m_failedFunctions.empty(); }
+
+    // ========================================================
+    // 解析导出函数的结果
+    // ========================================================
+    std::string GetResolveStatus() const;
+
+    // ========================================================
+    // 类查找与信息
+    // ========================================================
+    // 按命名空间+类名查找 结果缓存
+    Il2CppClass* GetClass(const std::string& namespaze, const std::string& className);
+    // 获取类名
+    const char* GetKlassName(Il2CppClass* klass) const;
+    // 获取命名空间名
+    const char* GetClassNamespace(Il2CppClass* klass) const;
+    // 获取父类
+    Il2CppClass* GetClassParent(Il2CppClass* klass) const;
+    // 获取对象实例大小（含对象头）
+    int32_t GetClassInstanceSize(Il2CppClass* klass) const;
+    // 获取类的 Il2CppType*
+    const Il2CppType* GetClassType(Il2CppClass* klass) const;
+
+    // ========================================================
+    // 方法查找与信息
+    // ========================================================
+    // 按方法名查找（不考虑参数个数）返回第一个同名方法
+    const Il2CppMethod* GetMethod(Il2CppClass* klass, const std::string& name) const;
+    // 获取方法名
+    const char* GetMethodName(const Il2CppMethod* method) const;
+    // 参数个数
+    int32_t GetMethodParamCount(const Il2CppMethod* method) const;
+    // 获取返回值类型
+    const Il2CppType* GetMethodReturnType(const Il2CppMethod* method) const;
+    // 获取指定位置参数的类型
+    const Il2CppType* GetMethodParamType(const Il2CppMethod* method, int32_t index) const;
+    // 方法标志位（判断静态/虚方法等）
+    uint32_t GetMethodFlags(const Il2CppMethod* method) const;
+    // 判断是否静态方法
+    bool IsStaticMethod(const Il2CppMethod* method) const;
+    // 获取方法所属的类
+    Il2CppClass* GetMethodClass(const Il2CppMethod* method) const;
+
+    // ========================================================
+    // 字段查找与信息
+    // ========================================================
+    // 按字段名查找
+    const Il2CppField* GetField(Il2CppClass* klass, const std::string& name) const;
+    // 获取字段名
+    const char* GetFieldName(const Il2CppField* field) const;
+    // 获取字段类型
+    const Il2CppType* GetFieldType(const Il2CppField* field) const;
+    // 获取字段偏移（在对象内的字节偏移）
+    int32_t GetFieldOffset(const Il2CppField* field) const;
+
+    // ========================================================
+    // 字段读写
+    // ========================================================
+    // 读实例字段
+    void ReadField(Il2CppObject* obj, const Il2CppField* field, void* outValue) const;
+    // 写实例字段
+    void WriteField(Il2CppObject* obj, const Il2CppField* field, void* value) const;
+    // 读静态字段
+    void ReadStaticField(const Il2CppField* field, void* outValue) const;
+    // 写静态字段
+    void WriteStaticField(const Il2CppField* field, void* value) const;
+
+    // ========================================================
+    // 运行时调用
+    // ========================================================
+    // 创建对象（分配内存 不调用构造函数）
+    Il2CppObject* ObjectNew(Il2CppClass* klass) const;
+    // 调用方法（通过 runtime_invoke）
+    Il2CppObject* RuntimeInvoke(const Il2CppMethod* method, void* obj, void** params, Il2CppException** outExc) const;
+    // 触发类的静态构造函数
+    void RuntimeClassInit(Il2CppClass* klass) const;
+
+    // ========================================================
+    // 字符串
+    // ========================================================
+    // 从 UTF-8 C 字符串创建 IL2CPP 托管字符串
+    Il2CppString* StringNew(const char* str) const;
+    // 从指定长度的 UTF-8 字节创建托管字符串（可包含嵌入 null）
+    Il2CppString* StringNewLen(const char* str, uint32_t len) const;
+    // 从 UTF-16 字符串创建托管字符串
+    Il2CppString* StringNewUtf16(const uint16_t* utf16, int32_t len) const;
+    // 读取字符串的 UTF-16 字符数组
+    const uint16_t* StringChars(Il2CppString* str) const;
+    // 读取字符串长度
+    int32_t StringLength(Il2CppString* str) const;
+
+    // ========================================================
+    // 装箱 / 拆箱
+    // ========================================================
+    // 将值类型数据装箱为托管对象
+    Il2CppObject* Box(Il2CppClass* klass, void* data) const;
+    // 将托管对象拆箱 返回值类型数据指针
+    void* Unbox(Il2CppObject* obj) const;
+
+    // ========================================================
+    // 类型信息
+    // ========================================================
+    // 获取 Il2CppType 的类型枚举值
+    int32_t GetTypeEnum(const Il2CppType* type) const;
+    // 获取类型的字符串名称
+    const char* GetTypeName(const Il2CppType* type) const;
+    // 从 Il2CppType 获取对应的 Il2CppClass
+    Il2CppClass* GetClassFromType(const Il2CppType* type) const;
+    // 从 Il2CppType 获取 System.Type 托管对象（用于 FindObjectsOfType）
+    Il2CppObject* GetTypeObject(const Il2CppType* type) const;
+
+    // ========================================================
+    // 数组
+    // ========================================================
+    // 创建一维零基数组
+    Il2CppArray*  ArrayNew(Il2CppClass* elementClass, uint64_t length) const;
+    // 读取数组长度（直接从内存布局读取）
+    uint64_t ArrayLength(Il2CppArray* arr) const;
+
+    // ========================================================
+    // GC 对象查找
+    // ========================================================
+    // 通过 Unity 的 UnityEngine.Object.FindObjectsOfType 查找存活对象
+    // 返回一个 Il2CppArray* 元素为找到的对象
+    // 注意：仅对继承自 UnityEngine.Object 的类型有效
+    Il2CppArray* FindObjectsOfType(Il2CppClass* klass);
+
+    // ========================================================
+    // 方法 / 字段枚举
+    // ========================================================
+    // 遍历类的所有方法 写入 outList 返回数量
+    int32_t EnumerateMethods(Il2CppClass* klass, const Il2CppMethod** outList, int32_t maxCount) const;
+    // 遍历类的所有字段
+    int32_t EnumerateFields(Il2CppClass* klass, const Il2CppField** outList, int32_t maxCount) const;
+
+private:
+    Il2CppResolver()  = default;
+    ~Il2CppResolver() = default;
+    Il2CppResolver(const Il2CppResolver&) = delete;
+    Il2CppResolver& operator=(const Il2CppResolver&) = delete;
+
+    // 解析 GameAssembly.dll 的所有导出函数
+    bool ResolveExports();
+    // 缓存所有 Image
+    void CacheAllImages();
+
+    // ========================================================
+    // IL2CPP 导出函数指针类型
+    // ========================================================
+
+    // --- 域 / 程序集 ---
+    typedef Il2CppDomain* (*pfn_domain_get)();
+    typedef Il2CppAssembly** (*pfn_domain_get_assemblies)(Il2CppDomain*, size_t*);
+    typedef Il2CppImage* (*pfn_assembly_get_image)(const Il2CppAssembly*);
+
+    // --- 线程 ---
+    typedef Il2CppThread* (*pfn_thread_attach)(Il2CppDomain*);
+    typedef void (*pfn_thread_detach)(Il2CppThread*);
+
+    // --- 类 ---
+    typedef Il2CppClass* (*pfn_class_from_name)(const Il2CppImage*, const char*, const char*);
+    typedef const char* (*pfn_class_get_name)(Il2CppClass*);
+    typedef const char* (*pfn_class_get_namespace)(Il2CppClass*);
+    typedef Il2CppClass* (*pfn_class_get_parent)(Il2CppClass*);
+    typedef int32_t (*pfn_class_instance_size)(Il2CppClass*);
+    typedef const Il2CppType* (*pfn_class_get_type)(Il2CppClass*);
+
+    // --- 方法 ---
+    typedef Il2CppClass* (*pfn_method_get_class)(const Il2CppMethod*);
+    typedef const Il2CppMethod* (*pfn_class_get_method_from_name)(Il2CppClass*, const char*, int);
+    typedef const Il2CppMethod* (*pfn_class_get_methods)(Il2CppClass*, void**);
+    typedef const char* (*pfn_method_get_name)(const Il2CppMethod*);
+    typedef int32_t (*pfn_method_get_param_count)(const Il2CppMethod*);
+    typedef const Il2CppType* (*pfn_method_get_return_type)(const Il2CppMethod*);
+    typedef const Il2CppType* (*pfn_method_get_param)(const Il2CppMethod*, int);
+    typedef uint32_t (*pfn_method_get_flags)(const Il2CppMethod*, uint16_t*);
+
+    // --- 字段 ---
+    typedef const Il2CppField* (*pfn_class_get_field_from_name)(Il2CppClass*, const char*);
+    typedef const Il2CppField* (*pfn_class_get_fields)(Il2CppClass*, void**);
+    typedef const char* (*pfn_field_get_name)(const Il2CppField*);
+    typedef const Il2CppType* (*pfn_field_get_type)(const Il2CppField*);
+    typedef int32_t (*pfn_field_get_offset)(const Il2CppField*);
+    typedef void (*pfn_field_get_value)(Il2CppObject*, const Il2CppField*, void*);
+    typedef void (*pfn_field_set_value)(Il2CppObject*, const Il2CppField*, void*);
+    typedef void (*pfn_field_static_get_value)(const Il2CppField*, void*);
+    typedef void (*pfn_field_static_set_value)(const Il2CppField*, void*);
+
+    // --- 运行时 ---
+    typedef Il2CppObject* (*pfn_object_new)(Il2CppClass*);
+    typedef Il2CppObject* (*pfn_runtime_invoke)(const Il2CppMethod*, void*, void**, Il2CppException**);
+    typedef void (*pfn_runtime_class_init)(Il2CppClass*);
+
+    // --- 字符串 ---
+    typedef Il2CppString* (*pfn_string_new)(const char*);
+    typedef Il2CppString* (*pfn_string_new_len)(const char*, uint32_t);
+    typedef Il2CppString* (*pfn_string_new_utf16)(const uint16_t*, int32_t);
+    typedef uint16_t* (*pfn_string_chars)(Il2CppString*);
+    typedef int32_t(*pfn_string_length)(Il2CppString*);
+
+    // --- 装箱 ---
+    typedef Il2CppObject* (*pfn_value_box)(Il2CppClass*, void*);
+    typedef void* (*pfn_object_unbox)(Il2CppObject*);
+
+    // --- 类型 ---
+    typedef int32_t(*pfn_type_get_type)(const Il2CppType*);
+    typedef const char* (*pfn_type_get_name)(const Il2CppType*);
+    typedef Il2CppClass* (*pfn_class_from_type)(const Il2CppType*);
+    typedef Il2CppObject* (*pfn_type_get_object)(const Il2CppType*);
+
+    // --- 数组 ---
+    typedef Il2CppArray* (*pfn_array_new)(Il2CppClass*, uint64_t);
+
+    // ========================================================
+    // 函数指针成员
+    // ========================================================
+    pfn_domain_get m_domain_get = nullptr;
+    pfn_domain_get_assemblies m_domain_get_assemblies = nullptr;
+    pfn_assembly_get_image m_assembly_get_image = nullptr;
+    pfn_thread_attach m_thread_attach = nullptr;
+    pfn_thread_detach m_thread_detach = nullptr;
+    pfn_class_from_name m_class_from_name = nullptr;
+    pfn_class_get_name m_class_get_name = nullptr;
+    pfn_class_get_namespace m_class_get_namespace = nullptr;
+    pfn_class_get_parent m_class_get_parent = nullptr;
+    pfn_class_instance_size m_class_instance_size = nullptr;
+    pfn_class_get_type m_class_get_type = nullptr;
+    pfn_method_get_class m_method_get_class = nullptr;
+    pfn_class_get_method_from_name m_class_get_method_from_name = nullptr;
+    pfn_class_get_methods m_class_get_methods = nullptr;
+    pfn_method_get_name m_method_get_name = nullptr;
+    pfn_method_get_param_count m_method_get_param_count = nullptr;
+    pfn_method_get_return_type m_method_get_return_type = nullptr;
+    pfn_method_get_param m_method_get_param = nullptr;
+    pfn_method_get_flags m_method_get_flags = nullptr;
+    pfn_class_get_field_from_name m_class_get_field_from_name = nullptr;
+    pfn_class_get_fields m_class_get_fields = nullptr;
+    pfn_field_get_name m_field_get_name = nullptr;
+    pfn_field_get_type  m_field_get_type = nullptr;
+    pfn_field_get_offset  m_field_get_offset = nullptr;
+    pfn_field_get_value m_field_get_value = nullptr;
+    pfn_field_set_value m_field_set_value = nullptr;
+    pfn_field_static_get_value m_field_static_get_value = nullptr;
+    pfn_field_static_set_value m_field_static_set_value = nullptr;
+    pfn_object_new m_object_new = nullptr;
+    pfn_runtime_invoke m_runtime_invoke = nullptr;
+    pfn_runtime_class_init m_runtime_class_init = nullptr;
+    pfn_string_new m_string_new = nullptr;
+    pfn_string_new_len m_string_new_len = nullptr;
+    pfn_string_new_utf16 m_string_new_utf16 = nullptr;
+    pfn_string_chars m_string_chars = nullptr;
+    pfn_string_length m_string_length = nullptr;
+    pfn_value_box m_value_box = nullptr;
+    pfn_object_unbox m_object_unbox = nullptr;
+    pfn_type_get_type m_type_get_type = nullptr;
+    pfn_type_get_name m_type_get_name = nullptr;
+    pfn_class_from_type m_class_from_type = nullptr;
+    pfn_type_get_object m_type_get_object = nullptr;
+    pfn_array_new m_array_new = nullptr;
+
+    // ========================================================
+    // 状态成员
+    // ========================================================
+    // 导出函数总数
+    int m_totalFunctions = 0;
+    // 查找失败的导出函数名称数组
+    std::vector<std::string> m_failedFunctions;
+    // IL2CPP 应用域
+    Il2CppDomain* m_domain = nullptr;
+    // 已 attach 的线程
+    Il2CppThread* m_thread = nullptr;
+    // 全量 Image 缓存
+    std::vector<Il2CppImage*> m_imageCache;
+    // 类缓存：key = (命名空间, 类名)
+    std::map<std::pair<std::string, std::string>, Il2CppClass*> m_classCache;
+
+    std::mutex m_mutex;
+    bool m_initialized = false;
+};
