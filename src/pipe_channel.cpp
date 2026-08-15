@@ -130,42 +130,120 @@ bool PipeChannel::ReadPipeNameFromSharedMemory(std::wstring& outPipeName)
 }
 
 // ============================================================
+// 打开管道客户端句柄（带 ERROR_PIPE_BUSY 重试）
+// ============================================================
+// 服务器已创建管道但尚未调用 ConnectNamedPipe 时 CreateFileW
+// 会返回 ERROR_PIPE_BUSY 需要用 WaitNamedPipeW 等待后重试
+// 句柄必须以 FILE_FLAG_OVERLAPPED 打开:
+// 阻塞模式下同一句柄的读写会被序列化——worker 线程常年阻塞在
+// RecvFrame(ReadFile) 等待命令 若游戏线程的 Hook 回调 print
+// -> SendLog(WriteFile) 复用同一句柄会被 pending read 卡死
+// 重叠模式下挂起的读不会阻塞其他线程的写
+static HANDLE OpenPipeClient(const std::wstring& pipeName, DWORD access)
+{
+    HANDLE h = CreateFileW(
+        pipeName.c_str(),     // 管道名称
+        access,               // 读/写权限
+        0,                    // 不共享
+        nullptr,              // 默认安全属性
+        OPEN_EXISTING,        // 管道必须已存在
+        FILE_FLAG_OVERLAPPED, // 重叠模式（挂起读不阻塞同句柄写）
+        nullptr);             // 无模板文件
+
+    // 连接失败 检查错误原因
+    if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PIPE_BUSY)
+    {
+        // 等待服务器就绪后再次尝试连接
+        if (WaitNamedPipeW(pipeName.c_str(), protocol::WAITSERVER_BUSY))
+        {
+            h = CreateFileW(pipeName.c_str(), access, 0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        }
+    }
+
+    return h;
+}
+
+// ============================================================
+// 重叠 I/O 读取（阻塞等待完成）
+// ============================================================
+// 每次调用创建事件 完成或失败后关闭
+// 返回 false 表示管道断开或读取失败
+static bool ReadPipeOverlapped(HANDLE pipe, void* buf, DWORD len, DWORD& bytesRead)
+{
+    OVERLAPPED ov{};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (ov.hEvent == nullptr) return false;
+
+    BOOL ok = ReadFile(pipe, buf, len, &bytesRead, &ov);
+    if (!ok)
+    {
+        // 读取尚未完成 等待事件后取结果
+        if (GetLastError() == ERROR_IO_PENDING)
+        {
+            if (WaitForSingleObject(ov.hEvent, INFINITE) == WAIT_OBJECT_0)
+            {
+                ok = GetOverlappedResult(pipe, &ov, &bytesRead, FALSE);
+            }
+            else
+            {
+                ok = FALSE;
+            }
+        }
+        else
+        {
+            // 管道断开等错误
+            ok = FALSE;
+        }
+    }
+
+    CloseHandle(ov.hEvent);
+    return ok != FALSE;
+}
+
+// ============================================================
+// 重叠 I/O 写入（阻塞等待完成）
+// ============================================================
+// 与 ReadPipeOverlapped 同理 保证挂起的读不阻塞本写入
+static bool WritePipeOverlapped(HANDLE pipe, const void* buf, DWORD len)
+{
+    OVERLAPPED ov{};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (ov.hEvent == nullptr) return false;
+
+    DWORD written = 0;
+    BOOL ok = WriteFile(pipe, buf, len, &written, &ov);
+    if (!ok)
+    {
+        if (GetLastError() == ERROR_IO_PENDING)
+        {
+            if (WaitForSingleObject(ov.hEvent, INFINITE) == WAIT_OBJECT_0)
+            {
+                ok = GetOverlappedResult(pipe, &ov, &written, FALSE);
+            }
+            else
+            {
+                ok = FALSE;
+            }
+        }
+        else
+        {
+            ok = FALSE;
+        }
+    }
+
+    CloseHandle(ov.hEvent);
+    return ok != FALSE && written == len;
+}
+
+// ============================================================
 // 连接到命名管道服务器
 // ============================================================
 bool PipeChannel::ConnectToPipe(const std::wstring& pipeName)
 {
-    // 第一次尝试连接
-    // CreateFileW 以客户端身份连接到命名管道
-    m_pipe = CreateFileW(
-        pipeName.c_str(),             // 管道名称
-        GENERIC_READ | GENERIC_WRITE, // 读写权限（全双工）
-        0,                            // 不共享
-        nullptr,                      // 默认安全属性
-        OPEN_EXISTING,                // 管道必须已存在
-        0,                            // 默认属性
-        nullptr);                     // 无模板文件
+    // 打开唯一的全双工句柄（FILE_FLAG_OVERLAPPED）
+    m_pipe = OpenPipeClient(pipeName, GENERIC_READ | GENERIC_WRITE);
 
-    // 如果连接失败 检查错误原因
-    if (m_pipe == INVALID_HANDLE_VALUE)
-    {
-        // 获取错误码
-        DWORD err = GetLastError();
-
-        // 管道忙 服务器已创建管道但尚未调用 ConnectNamedPipe
-        if (err == ERROR_PIPE_BUSY)
-        {
-            // 使用 WaitNamedPipeW 等待服务器就绪
-            if (WaitNamedPipeW(pipeName.c_str(), protocol::WAITSERVER_BUSY))
-            {
-                // 服务器已就绪 再次尝试连接
-                m_pipe = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-            }
-        }
-        // 其他错误码（如 ERROR_FILE_NOT_FOUND）表示管道不存在
-        // 直接返回失败
-    }
-
-    // 检查连接是否成功
+    // 连接失败
     if (m_pipe == INVALID_HANDLE_VALUE) return false;
 
     // 设置管道为字节模式
@@ -189,9 +267,23 @@ bool PipeChannel::SendFrame(uint8_t type, const void* data, uint32_t len)
     // 多个线程可能同时调用 SendLog（主线程执行 Lua + Hook 回调线程）
     std::lock_guard<std::mutex> lock(m_writeMutex);
 
-    // 调用协议层写入帧
-    // protocol::WriteFrame 内部完成帧头构造和数据写入
-    return protocol::WriteFrame(m_pipe, type, data, len);
+    // 构造帧头: 1 字节类型 + 4 字节长度（小端）
+    uint8_t header[protocol::HEADER_SIZE]{};
+    header[0] = type;
+    header[1] = static_cast<uint8_t>(len & 0xFF);
+    header[2] = static_cast<uint8_t>((len >> 8) & 0xFF);
+    header[3] = static_cast<uint8_t>((len >> 16) & 0xFF);
+    header[4] = static_cast<uint8_t>((len >> 24) & 0xFF);
+
+    // 写帧头（重叠 I/O 挂起的读不会阻塞本写入）
+    if (!WritePipeOverlapped(m_pipe, header, protocol::HEADER_SIZE)) return false;
+
+    // 写负载
+    if (len > 0 && data != nullptr)
+    {
+        if (!WritePipeOverlapped(m_pipe, data, len)) return false;
+    }
+    return true;
 }
 
 // ============================================================
@@ -266,30 +358,52 @@ bool PipeChannel::RecvFrame(uint8_t& type, std::vector<uint8_t>& payload)
     // 前置检查
     if (!m_connected || m_pipe == INVALID_HANDLE_VALUE) return false;
 
-    // 调用协议层读取帧
-    // protocol::ReadFrame 使用内部静态缓冲区
-    // 返回的 data 指针在下次调用时失效
-    // 因此需要立即拷贝数据
-    uint8_t* data = nullptr;
-    uint32_t len = 0;
+    // ---- 读取帧头: 1 字节类型 + 4 字节长度（小端）----
+    uint8_t header[protocol::HEADER_SIZE]{};
+    DWORD total = 0;
+    while (total < protocol::HEADER_SIZE)
+    {
+        DWORD chunk = 0;
+        if (!ReadPipeOverlapped(m_pipe, header + total,
+                static_cast<DWORD>(protocol::HEADER_SIZE) - total, chunk) || chunk == 0)
+        {
+            // 管道断开或错误
+            m_connected = false;
+            return false;
+        }
+        total += chunk;
+    }
 
-    // 读取失败：管道断开或错误
-    if (!protocol::ReadFrame(m_pipe, type, data, len))
+    // 解析帧头
+    type = header[0];
+    uint32_t len = static_cast<uint32_t>(header[1])
+                 | (static_cast<uint32_t>(header[2]) << 8)
+                 | (static_cast<uint32_t>(header[3]) << 16)
+                 | (static_cast<uint32_t>(header[4]) << 24);
+
+    // 长度校验：防止恶意/损坏的帧头导致缓冲区溢出
+    if (len > protocol::MAX_PAYLOAD)
     {
         m_connected = false;
         return false;
     }
 
-    // 将数据拷贝到 vector 中（安全持有）
-    if (len > 0 && data != nullptr)
+    // ---- 读取负载 ----
+    payload.clear();
+    if (len > 0)
     {
-        // 深拷贝负载数据
-        payload.assign(data, data + len);
-    }
-    else
-    {
-        // 无负载 清空
-        payload.clear();
+        payload.resize(len);
+        total = 0;
+        while (total < len)
+        {
+            DWORD chunk = 0;
+            if (!ReadPipeOverlapped(m_pipe, payload.data() + total, len - total, chunk) || chunk == 0)
+            {
+                m_connected = false;
+                return false;
+            }
+            total += chunk;
+        }
     }
 
     return true;
@@ -306,9 +420,9 @@ void PipeChannel::Shutdown()
     std::lock_guard<std::mutex> lock(m_writeMutex);
 
     // 关闭管道句柄
+    // 关闭句柄会使任何阻塞的管道操作立即失败返回
     if (m_pipe != INVALID_HANDLE_VALUE)
     {
-        // 关闭管道句柄
         CloseHandle(m_pipe);
         m_pipe = INVALID_HANDLE_VALUE;
     }

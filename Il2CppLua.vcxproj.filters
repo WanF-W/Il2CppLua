@@ -7,6 +7,9 @@
     <Filter Include="src">
       <UniqueIdentifier>{20f53811-9f84-4b91-be4b-c905b4f97935}</UniqueIdentifier>
     </Filter>
+    <Filter Include="minhook_src">
+      <UniqueIdentifier>{3d8d42f1-2b4e-4c5e-9f1a-7d0b2a5c6e71}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="lua_src\lapi.c">
@@ -114,12 +117,35 @@
     <ClCompile Include="src\il2cpp_resolver.cpp">
       <Filter>src</Filter>
     </ClCompile>
+    <ClCompile Include="src\il2cpp_hook.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
     <ClCompile Include="src\lua_bridge.cpp">
       <Filter>src</Filter>
     </ClCompile>
     <ClCompile Include="src\dll_main.cpp">
       <Filter>src</Filter>
     </ClCompile>
+    <ClCompile Include="minhook_src\buffer.c">
+      <Filter>minhook_src</Filter>
+    </ClCompile>
+    <ClCompile Include="minhook_src\hde32.c">
+      <Filter>minhook_src</Filter>
+    </ClCompile>
+    <ClCompile Include="minhook_src\hde64.c">
+      <Filter>minhook_src</Filter>
+    </ClCompile>
+    <ClCompile Include="minhook_src\hook.c">
+      <Filter>minhook_src</Filter>
+    </ClCompile>
+    <ClCompile Include="minhook_src\trampoline.c">
+      <Filter>minhook_src</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Masm Include="src\hook_stub.asm">
+      <Filter>src</Filter>
+    </Masm>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="lua_src\lapi.h">
@@ -223,6 +249,12 @@
     </ClInclude>
     <ClInclude Include="src\il2cpp_resolver.h">
       <Filter>src</Filter>
+    </ClInclude>
+    <ClInclude Include="src\il2cpp_hook.h">
+      <Filter>src</Filter>
+    </ClInclude>
+    <ClInclude Include="minhook_src\MinHook.h">
+      <Filter>minhook_src</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

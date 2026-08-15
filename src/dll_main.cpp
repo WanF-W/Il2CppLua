@@ -32,6 +32,7 @@
 
 #include "pipe_channel.h"
 #include "il2cpp_resolver.h"
+#include "il2cpp_hook.h"
 #include "lua_engine.h"
 #include "protocol.h"
 
@@ -296,6 +297,10 @@ exit_loop:
     // 清理（逆序关闭各模块）
     // ========================================================
 
+    // 卸载全部 Hook（必须在 LuaEngine::Shutdown 之前
+    // 保证回调的 Lua 引用在释放时仍然有效）
+    Il2CppHook::Shutdown();
+
     // 关闭 Lua 引擎
     LuaEngine::Instance().Shutdown();
 
@@ -336,6 +341,7 @@ static DWORD WINAPI WorkerThreadProc(LPVOID lpParam)
         PipeChannel::Instance().SendError("fatal exception in worker thread");
 
         // 确保资源被清理
+        Il2CppHook::Shutdown();
         LuaEngine::Instance().Shutdown();
         Il2CppResolver::Instance().Shutdown();
         PipeChannel::Instance().Shutdown();

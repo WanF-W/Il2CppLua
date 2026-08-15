@@ -113,6 +113,8 @@ void Il2CppResolver::Shutdown()
     m_class_get_parent = nullptr;
     m_class_instance_size = nullptr;
     m_class_get_type = nullptr;
+    m_class_get_element_class = nullptr;
+    m_class_value_size = nullptr;
     m_method_get_class = nullptr;
     m_class_get_method_from_name = nullptr;
     m_class_get_methods = nullptr;
@@ -191,6 +193,8 @@ bool Il2CppResolver::ResolveExports()
     RESOLVE(class_get_parent, pfn_class_get_parent);
     RESOLVE(class_instance_size, pfn_class_instance_size);
     RESOLVE(class_get_type, pfn_class_get_type);
+    RESOLVE(class_get_element_class, pfn_class_get_element_class);
+    RESOLVE(class_value_size, pfn_class_value_size);
 
     // 方法操作
     RESOLVE(method_get_class, pfn_method_get_class);
@@ -474,8 +478,8 @@ const Il2CppType* Il2CppResolver::GetMethodParamType(const Il2CppMethod* method,
 uint32_t Il2CppResolver::GetMethodFlags(const Il2CppMethod* method) const
 {
     if (method == nullptr || m_method_get_flags == nullptr) return 0;
-    // il2cpp_method_get_flags 签名为 (method, uint16_t* used_param_count)
-    // 第二个参数可选 传入 nullptr 表示不关心
+    // il2cpp_method_get_flags 签名为 (method, uint32_t* iflags)
+    // 第二个参数输出方法实现标志 传 nullptr 表示不关心
     return m_method_get_flags(method, nullptr);
 }
 
@@ -492,9 +496,32 @@ Il2CppClass* Il2CppResolver::GetMethodClass(const Il2CppMethod* method) const
 {
     if (method == nullptr) return nullptr;
     if (m_method_get_class != nullptr) return m_method_get_class(method);
-    // Fallback: MethodInfo 结构第一个字段就是 Il2CppClass* klass
-    // 这在所有已知 Unity IL2CPP 版本中都是稳定的
-    return *reinterpret_cast<Il2CppClass**>(const_cast<Il2CppMethod*>(method));
+    // 注意: MethodInfo 的第一个字段是 methodPointer（offset 0x00）
+    // 不是 klass 因此不能直接按偏移 0 读取
+    // 导出缺失时返回 nullptr 由调用方决定是否可用
+    return nullptr;
+}
+
+// ========================================================
+// 线程与原生方法
+// ========================================================
+
+// 将当前线程附加到 IL2CPP 运行时
+// Hook 回调可能发生在任意游戏线程 调用 IL2CPP API 前必须先附加
+// 官方签名: Il2CppThread* il2cpp_thread_attach(Il2CppDomain* domain)
+// 已附加的线程重复调用会返回已有的 Il2CppThread* 因此可以每次调用
+Il2CppThread* Il2CppResolver::AttachThread() const
+{
+    if (!m_initialized || m_thread_attach == nullptr || m_domain == nullptr) return nullptr;
+    return m_thread_attach(m_domain);
+}
+
+// 读取 MethodInfo 中的原生函数指针
+// MethodInfo 布局: methodPointer 始终位于 offset 0x00（见 common.h）
+void* Il2CppResolver::GetMethodPointer(const Il2CppMethod* method) const
+{
+    if (method == nullptr) return nullptr;
+    return READ_OFFSET(method, METHODINFO_METHODPOINTER_OFFSET, void*)[0];
 }
 
 // ============================================================
@@ -718,6 +745,21 @@ Il2CppClass* Il2CppResolver::GetClassFromType(const Il2CppType* type) const
     return m_class_from_type(type);
 }
 
+// 获取数组类的元素类型
+Il2CppClass* Il2CppResolver::GetElementClass(Il2CppClass* klass) const
+{
+    if (klass == nullptr || m_class_get_element_class == nullptr) return nullptr;
+    return m_class_get_element_class(klass);
+}
+
+// 获取值类型的实际大小
+// 官方签名: int32_t il2cpp_class_value_size(Il2CppClass* klass, uint32_t* align)
+int32_t Il2CppResolver::ClassValueSize(Il2CppClass* klass, uint32_t* align) const
+{
+    if (klass == nullptr || m_class_value_size == nullptr) return 0;
+    return m_class_value_size(klass, align);
+}
+
 // 从 Il2CppType 获取 System.Type 托管对象
 // 这是 FindObjectsOfType 的前置步骤
 // 
@@ -737,9 +779,9 @@ Il2CppObject* Il2CppResolver::GetTypeObject(const Il2CppType* type) const
 // 参数
 // 
 // ·elementClass — 数组元素的类型
-// ·length       — 数组长度
+// ·length       — 数组长度（官方类型为 il2cpp_array_size_t 即 uint32_t）
 // 返回 Il2CppArray* 指针
-Il2CppArray* Il2CppResolver::ArrayNew(Il2CppClass* elementClass, uint64_t length) const
+Il2CppArray* Il2CppResolver::ArrayNew(Il2CppClass* elementClass, uint32_t length) const
 {
     if (elementClass == nullptr || m_array_new == nullptr) return nullptr;
     return m_array_new(elementClass, length);

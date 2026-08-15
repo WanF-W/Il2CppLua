@@ -87,8 +87,10 @@ public:
     // 获取输出回调
     const OutputCallback& GetOutputCallback() const { return m_outputCb; }
 
-    // 获取互斥锁
-    std::mutex& GetMutex() { return m_luaMutex; }
+    // 获取互斥锁（可重入）
+    // Hook 回调可能在同一线程内递归触发（回调内调用被 Hook 的方法）
+    // 因此使用 std::recursive_mutex 保证同线程可重复加锁
+    std::recursive_mutex& GetMutex() { return m_luaMutex; }
 
 private:
     LuaEngine()  = default;
@@ -106,5 +108,5 @@ private:
     lua_State*     m_L           = nullptr;
     bool           m_initialized = false;
     OutputCallback m_outputCb;
-    std::mutex     m_luaMutex;
+    std::recursive_mutex m_luaMutex;
 };

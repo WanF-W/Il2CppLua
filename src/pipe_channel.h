@@ -125,7 +125,7 @@ private:
     bool ConnectToPipe(const std::wstring& pipeName);
 
     // ---- 成员变量 ----
-    HANDLE       m_pipe       = INVALID_HANDLE_VALUE; // 命名管道句柄
+    HANDLE       m_pipe       = INVALID_HANDLE_VALUE; // 命名管道句柄（FILE_FLAG_OVERLAPPED 重叠模式）
     bool         m_connected  = false;                // 连接状态标志
     std::mutex   m_writeMutex;                        // 写操作互斥锁
 };

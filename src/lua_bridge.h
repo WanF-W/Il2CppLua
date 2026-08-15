@@ -114,6 +114,10 @@ void LuaBridge_PushMethod(lua_State* L, const Il2CppMethod* method, Il2CppClass*
 // 创建 Field userdata 并压栈
 void LuaBridge_PushField(lua_State* L, const Il2CppField* field, Il2CppClass* klass);
 
+// 创建 IL2CPP 字符串对应的 Lua 字符串并压栈
+// 内部将 UTF-16 转换为 UTF-8（Hook 回调参数编组等场景使用）
+void LuaBridge_PushString(lua_State* L, Il2CppString* str);
+
 // ============================================================
 // Userdata 类型检查辅助函数
 // ============================================================
@@ -136,6 +140,17 @@ LuaFieldUD* LuaBridge_CheckField(lua_State* L, int idx);
  * @param returnType  方法返回值类型（可为 nullptr 表示 void）
  */
 void LuaBridge_PushReturnValue(lua_State* L, Il2CppObject* result, const Il2CppType* returnType);
+
+/**
+ * 将 Lua 栈上的值编组为 C# 参数（与 mth:call 使用同一套逻辑）
+ * @param L           Lua 状态机
+ * @param idx         Lua 栈上参数位置
+ * @param type        IL2CPP 参数类型
+ * @param storage     至少 16 字节的存储区（基本类型/值类型写入）
+ * @param outParam    输出: 供 runtime_invoke 使用的参数指针
+ * @return true 编组成功
+ */
+bool LuaBridge_MarshalArg(lua_State* L, int idx, const Il2CppType* type, void* storage, void*& outParam);
 
 /**
  * 检查一个 IL2CPP 对象是否为数组

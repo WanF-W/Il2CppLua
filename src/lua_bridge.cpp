@@ -39,6 +39,7 @@
 #include "il2cpp_resolver.h"
 #include "lua_engine.h"
 #include "pipe_channel.h"
+#include "il2cpp_hook.h"
 
 #include <windows.h>
 #include <cstdarg>
@@ -104,7 +105,7 @@ static bool IsRefType(int32_t typeEnum)
 // ============================================================
 // IL2CPP 字符串内部以 UTF-16 存储 Lua 字符串以 UTF-8 存储
 // 使用 WideCharToMultiByte 进行转换
-static void PushIl2CppString(lua_State* L, Il2CppString* str)
+void LuaBridge_PushString(lua_State* L, Il2CppString* str)
 {
     // 获取解析器引用
     auto& resolver = Il2CppResolver::Instance();
@@ -170,6 +171,22 @@ static bool MarshalArg(lua_State* L, int idx, const Il2CppType* type, void* stor
     // 获取参数的 IL2CPP 类型枚举
     int32_t typeEnum = resolver.GetTypeEnum(type);
 
+    // 泛型实例化类型（如 List<T> / 泛型 struct）先解析出实际类别
+    // 值类型按值类型处理 其余按引用类型处理
+    if (typeEnum == Il2CppTypeEnum::TYPE_GENERICINST)
+    {
+        Il2CppClass* gclass = resolver.GetClassFromType(type);
+        const Il2CppType* gtype = gclass ? resolver.GetClassType(gclass) : nullptr;
+        if (gtype != nullptr)
+        {
+            int32_t genEnum = resolver.GetTypeEnum(gtype);
+            typeEnum = (genEnum == Il2CppTypeEnum::TYPE_VALUETYPE
+                || genEnum == Il2CppTypeEnum::TYPE_ENUM)
+                ? Il2CppTypeEnum::TYPE_VALUETYPE
+                : Il2CppTypeEnum::TYPE_CLASS;
+        }
+    }
+
     // 根据类型枚举进行编组
     switch (typeEnum)
     {
@@ -223,6 +240,12 @@ static bool MarshalArg(lua_State* L, int idx, const Il2CppType* type, void* stor
         outParam = storage;
         return true;
 
+    // 枚举（底层一般为 int32 与旧版 hook 行为一致）
+    case Il2CppTypeEnum::TYPE_ENUM:
+        *static_cast<int32_t*>(storage) = static_cast<int32_t>(lua_tointeger(L, idx));
+        outParam = storage;
+        return true;
+
     // 浮点类型
     case Il2CppTypeEnum::TYPE_R4:
         *static_cast<float*>(storage) = static_cast<float>(lua_tonumber(L, idx));
@@ -256,6 +279,7 @@ static bool MarshalArg(lua_State* L, int idx, const Il2CppType* type, void* stor
     case Il2CppTypeEnum::TYPE_CLASS:
     case Il2CppTypeEnum::TYPE_OBJECT:
     case Il2CppTypeEnum::TYPE_SZARRAY:
+    case Il2CppTypeEnum::TYPE_ARRAY:
     {
         // Instance userdata → Il2CppObject*
         // 同样 引用类型直接传对象指针
@@ -286,6 +310,21 @@ static bool MarshalArg(lua_State* L, int idx, const Il2CppType* type, void* stor
         outParam = storage;
         return true;
 
+    // 原生指针类型 (T* / 函数指针)
+    case Il2CppTypeEnum::TYPE_PTR:
+    case Il2CppTypeEnum::TYPE_FNPTR:
+        // 接受 Lua 整数或 lightuserdata
+        if (lua_islightuserdata(L, idx))
+        {
+            *static_cast<void**>(storage) = lua_touserdata(L, idx);
+        }
+        else
+        {
+            *static_cast<void**>(storage) = reinterpret_cast<void*>(static_cast<intptr_t>(lua_tointeger(L, idx)));
+        }
+        outParam = storage;
+        return true;
+
     // 值类型 (struct)
     case Il2CppTypeEnum::TYPE_VALUETYPE:
     {
@@ -293,10 +332,10 @@ static bool MarshalArg(lua_State* L, int idx, const Il2CppType* type, void* stor
         // 或 Instance userdata（已装箱的值类型）
         if (lua_islightuserdata(L, idx))
         {
-            // 直接使用原始指针作为值类型数据
-            void* ptr = lua_touserdata(L, idx);
-            memcpy(storage, &ptr, sizeof(void*));
-            outParam = storage;
+            // lightuserdata 本身就是要传的值类型数据指针
+            // runtime_invoke 对值类型参数要求 params[i] 指向值数据
+            // 因此直接透传 而不是把指针值复制到 storage
+            outParam = lua_touserdata(L, idx);
             return true;
         }
         else if (lua_isnil(L, idx))
@@ -316,11 +355,10 @@ static bool MarshalArg(lua_State* L, int idx, const Il2CppType* type, void* stor
             void* unboxed = resolver.Unbox(ud->obj);
             if (unboxed == nullptr) return false;
 
-            // 复制值类型数据到 storage
-            // 注意：我们不知道确切大小 复制 16 字节作为兜底
-            // 对于大多数值类型（int, float, Vector3 等）足够
-            memcpy(storage, unboxed, 16);
-            outParam = storage;
+            // 直接使用拆箱后的数据指针作为参数
+            // 不再固定复制 16 字节：超过 16 字节的结构体会溢出 storage
+            // 调用期间装箱对象由 Lua userdata 持有 数据指针保持有效
+            outParam = unboxed;
             return true;
         }
     }
@@ -337,6 +375,12 @@ static bool MarshalArg(lua_State* L, int idx, const Il2CppType* type, void* stor
         // 编组失败
         return false;
     }
+}
+
+// 公开包装: 供 il2cpp_hook.cpp 的 original() 显式传参复用同一套编组
+bool LuaBridge_MarshalArg(lua_State* L, int idx, const Il2CppType* type, void* storage, void*& outParam)
+{
+    return MarshalArg(L, idx, type, storage, outParam);
 }
 
 // ============================================================
@@ -612,7 +656,7 @@ void LuaBridge_PushReturnValue(lua_State* L, Il2CppObject* result, const Il2CppT
 
     // 字符串
     case Il2CppTypeEnum::TYPE_STRING:
-        PushIl2CppString(L, reinterpret_cast<Il2CppString*>(result));
+        LuaBridge_PushString(L, reinterpret_cast<Il2CppString*>(result));
         break;
 
     // 引用类型、数组、值类型、其他 → Instance userdata
@@ -640,9 +684,11 @@ bool LuaBridge_IsArray(Il2CppObject* obj)
     const Il2CppType* type = resolver.GetClassType(klass);
     if (type == nullptr) return false;
 
-    // 检查类型枚举是否为 SZARRAY (一维零基数组)
+    // 检查类型枚举是否为数组类型
+    // SZARRAY = 一维零基数组 ARRAY = 多维数组
     int32_t typeEnum = resolver.GetTypeEnum(type);
-    return typeEnum == Il2CppTypeEnum::TYPE_SZARRAY;
+    return typeEnum == Il2CppTypeEnum::TYPE_SZARRAY
+        || typeEnum == Il2CppTypeEnum::TYPE_ARRAY;
 }
 
 uint64_t LuaBridge_GetArrayLength(Il2CppObject* arr)
@@ -650,6 +696,348 @@ uint64_t LuaBridge_GetArrayLength(Il2CppObject* arr)
     if (arr == nullptr) return 0;
     auto& resolver = Il2CppResolver::Instance();
     return resolver.ArrayLength(reinterpret_cast<Il2CppArray*>(arr));
+}
+
+// ============================================================
+// 数组元素类型与大小辅助
+// ============================================================
+
+// 获取数组元素类与元素大小
+// 引用类型元素固定为指针大小 值类型元素通过 class_value_size 获取实际大小
+// 旧版 Unity 缺少导出时回退按引用类型指针处理（保持旧行为）
+static bool LuaBridge_GetArrayElementInfo(Il2CppObject* arr, Il2CppClass*& outElemClass, int32_t& outElemSize)
+{
+    if (arr == nullptr) return false;
+
+    auto& resolver = Il2CppResolver::Instance();
+
+    // 从对象头读取数组类
+    Il2CppClass* arrayClass = READ_OFFSET(arr, 0, Il2CppClass*)[0];
+    if (arrayClass == nullptr) return false;
+
+    // 通过官方 API 获取元素类（仅数组类有效）
+    outElemClass = resolver.GetElementClass(arrayClass);
+    if (outElemClass == nullptr)
+    {
+        // 无法确定元素类型 回退为指针大小（按引用类型数组处理）
+        outElemSize = static_cast<int32_t>(sizeof(void*));
+        return true;
+    }
+
+    // 元素类型枚举
+    const Il2CppType* elemType = resolver.GetClassType(outElemClass);
+    int32_t typeEnum = elemType ? resolver.GetTypeEnum(elemType) : 0;
+
+    // 引用类型（含多维数组）元素固定为指针大小
+    if (IsRefType(typeEnum) || typeEnum == Il2CppTypeEnum::TYPE_ARRAY)
+    {
+        outElemSize = static_cast<int32_t>(sizeof(void*));
+        return true;
+    }
+
+    // 基本类型按固定大小映射
+    switch (typeEnum)
+    {
+    case Il2CppTypeEnum::TYPE_BOOLEAN:
+    case Il2CppTypeEnum::TYPE_I1:
+    case Il2CppTypeEnum::TYPE_U1:
+        outElemSize = 1;
+        return true;
+    case Il2CppTypeEnum::TYPE_CHAR:
+    case Il2CppTypeEnum::TYPE_I2:
+    case Il2CppTypeEnum::TYPE_U2:
+        outElemSize = 2;
+        return true;
+    case Il2CppTypeEnum::TYPE_I4:
+    case Il2CppTypeEnum::TYPE_U4:
+    case Il2CppTypeEnum::TYPE_R4:
+        outElemSize = 4;
+        return true;
+    case Il2CppTypeEnum::TYPE_I8:
+    case Il2CppTypeEnum::TYPE_U8:
+    case Il2CppTypeEnum::TYPE_R8:
+    case Il2CppTypeEnum::TYPE_I:
+    case Il2CppTypeEnum::TYPE_U:
+        outElemSize = 8;
+        return true;
+    case Il2CppTypeEnum::TYPE_VALUETYPE:
+    {
+        // 结构体元素：通过 value_size 获取实际大小
+        uint32_t align = 0;
+        int32_t size = resolver.ClassValueSize(outElemClass, &align);
+        if (size <= 0) return false;
+        outElemSize = size;
+        return true;
+    }
+    default:
+        // 未知类型 回退为指针大小
+        outElemSize = static_cast<int32_t>(sizeof(void*));
+        return true;
+    }
+}
+
+// 将数组第 index 个元素转换为 Lua 值压栈
+// 返回 false 表示元素类型不支持
+static bool LuaBridge_PushArrayElement(lua_State* L, Il2CppObject* arr, int64_t index)
+{
+    Il2CppClass* elemClass = nullptr;
+    int32_t elemSize = 0;
+    if (!LuaBridge_GetArrayElementInfo(arr, elemClass, elemSize)) return false;
+
+    auto& resolver = Il2CppResolver::Instance();
+    uint8_t* elemPtr = reinterpret_cast<uint8_t*>(arr) + ARRAY_DATA_OFFSET + index * elemSize;
+
+    // 元素类未知 按引用类型指针处理（保持旧行为）
+    if (elemClass == nullptr)
+    {
+        Il2CppObject* elem = *reinterpret_cast<Il2CppObject**>(elemPtr);
+        LuaBridge_PushInstance(L, elem, nullptr);
+        return true;
+    }
+
+    const Il2CppType* elemType = resolver.GetClassType(elemClass);
+    int32_t typeEnum = elemType ? resolver.GetTypeEnum(elemType) : 0;
+
+    switch (typeEnum)
+    {
+    case Il2CppTypeEnum::TYPE_BOOLEAN:
+        lua_pushboolean(L, *reinterpret_cast<bool*>(elemPtr));
+        return true;
+    case Il2CppTypeEnum::TYPE_CHAR:
+    case Il2CppTypeEnum::TYPE_U2:
+        lua_pushinteger(L, *reinterpret_cast<uint16_t*>(elemPtr));
+        return true;
+    case Il2CppTypeEnum::TYPE_I1:
+        lua_pushinteger(L, *reinterpret_cast<int8_t*>(elemPtr));
+        return true;
+    case Il2CppTypeEnum::TYPE_U1:
+        lua_pushinteger(L, *reinterpret_cast<uint8_t*>(elemPtr));
+        return true;
+    case Il2CppTypeEnum::TYPE_I2:
+        lua_pushinteger(L, *reinterpret_cast<int16_t*>(elemPtr));
+        return true;
+    case Il2CppTypeEnum::TYPE_I4:
+        lua_pushinteger(L, *reinterpret_cast<int32_t*>(elemPtr));
+        return true;
+    case Il2CppTypeEnum::TYPE_U4:
+        lua_pushinteger(L, *reinterpret_cast<uint32_t*>(elemPtr));
+        return true;
+    case Il2CppTypeEnum::TYPE_I8:
+        lua_pushinteger(L, *reinterpret_cast<int64_t*>(elemPtr));
+        return true;
+    case Il2CppTypeEnum::TYPE_U8:
+        // lua_Integer 为有符号 64 位 超过 INT64_MAX 的值会回绕
+        lua_pushinteger(L, static_cast<lua_Integer>(*reinterpret_cast<uint64_t*>(elemPtr)));
+        return true;
+    case Il2CppTypeEnum::TYPE_R4:
+        lua_pushnumber(L, *reinterpret_cast<float*>(elemPtr));
+        return true;
+    case Il2CppTypeEnum::TYPE_R8:
+        lua_pushnumber(L, *reinterpret_cast<double*>(elemPtr));
+        return true;
+    case Il2CppTypeEnum::TYPE_I:
+    case Il2CppTypeEnum::TYPE_U:
+        lua_pushinteger(L, static_cast<lua_Integer>(*reinterpret_cast<intptr_t*>(elemPtr)));
+        return true;
+    case Il2CppTypeEnum::TYPE_STRING:
+    {
+        Il2CppString* str = *reinterpret_cast<Il2CppString**>(elemPtr);
+        if (str != nullptr) LuaBridge_PushString(L, str);
+        else lua_pushnil(L);
+        return true;
+    }
+    case Il2CppTypeEnum::TYPE_CLASS:
+    case Il2CppTypeEnum::TYPE_OBJECT:
+    case Il2CppTypeEnum::TYPE_SZARRAY:
+    case Il2CppTypeEnum::TYPE_ARRAY:
+    {
+        Il2CppObject* elem = *reinterpret_cast<Il2CppObject**>(elemPtr);
+        LuaBridge_PushInstance(L, elem, elemClass);
+        return true;
+    }
+    case Il2CppTypeEnum::TYPE_VALUETYPE:
+    {
+        // 结构体元素：装箱后包装为 Instance
+        Il2CppObject* boxed = resolver.Box(elemClass, elemPtr);
+        LuaBridge_PushInstance(L, boxed, elemClass);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+// 将 Lua 栈上 valueIdx 位置的值写入数组第 index 个元素
+// 返回 false 表示元素类型不支持或值类型不匹配
+static bool LuaBridge_SetArrayElement(lua_State* L, Il2CppObject* arr, int64_t index, int valueIdx)
+{
+    Il2CppClass* elemClass = nullptr;
+    int32_t elemSize = 0;
+    if (!LuaBridge_GetArrayElementInfo(arr, elemClass, elemSize)) return false;
+
+    auto& resolver = Il2CppResolver::Instance();
+    uint8_t* elemPtr = reinterpret_cast<uint8_t*>(arr) + ARRAY_DATA_OFFSET + index * elemSize;
+
+    // 元素类未知 按引用类型指针处理（保持旧行为）
+    if (elemClass == nullptr)
+    {
+        if (lua_isnil(L, valueIdx)) *reinterpret_cast<Il2CppObject**>(elemPtr) = nullptr;
+        else
+        {
+            LuaInstanceUD* valUD = LuaBridge_CheckInstance(L, valueIdx);
+            if (valUD == nullptr) return false;
+            *reinterpret_cast<Il2CppObject**>(elemPtr) = valUD->obj;
+        }
+        return true;
+    }
+
+    const Il2CppType* elemType = resolver.GetClassType(elemClass);
+    int32_t typeEnum = elemType ? resolver.GetTypeEnum(elemType) : 0;
+
+    switch (typeEnum)
+    {
+    case Il2CppTypeEnum::TYPE_BOOLEAN:
+        *reinterpret_cast<bool*>(elemPtr) = lua_toboolean(L, valueIdx) != 0;
+        return true;
+    case Il2CppTypeEnum::TYPE_CHAR:
+    case Il2CppTypeEnum::TYPE_U2:
+        *reinterpret_cast<uint16_t*>(elemPtr) = static_cast<uint16_t>(lua_tointeger(L, valueIdx));
+        return true;
+    case Il2CppTypeEnum::TYPE_I1:
+        *reinterpret_cast<int8_t*>(elemPtr) = static_cast<int8_t>(lua_tointeger(L, valueIdx));
+        return true;
+    case Il2CppTypeEnum::TYPE_U1:
+        *reinterpret_cast<uint8_t*>(elemPtr) = static_cast<uint8_t>(lua_tointeger(L, valueIdx));
+        return true;
+    case Il2CppTypeEnum::TYPE_I2:
+        *reinterpret_cast<int16_t*>(elemPtr) = static_cast<int16_t>(lua_tointeger(L, valueIdx));
+        return true;
+    case Il2CppTypeEnum::TYPE_I4:
+        *reinterpret_cast<int32_t*>(elemPtr) = static_cast<int32_t>(lua_tointeger(L, valueIdx));
+        return true;
+    case Il2CppTypeEnum::TYPE_U4:
+        *reinterpret_cast<uint32_t*>(elemPtr) = static_cast<uint32_t>(lua_tointeger(L, valueIdx));
+        return true;
+    case Il2CppTypeEnum::TYPE_I8:
+        *reinterpret_cast<int64_t*>(elemPtr) = static_cast<int64_t>(lua_tointeger(L, valueIdx));
+        return true;
+    case Il2CppTypeEnum::TYPE_U8:
+        *reinterpret_cast<uint64_t*>(elemPtr) = static_cast<uint64_t>(lua_tointeger(L, valueIdx));
+        return true;
+    case Il2CppTypeEnum::TYPE_R4:
+        *reinterpret_cast<float*>(elemPtr) = static_cast<float>(lua_tonumber(L, valueIdx));
+        return true;
+    case Il2CppTypeEnum::TYPE_R8:
+        *reinterpret_cast<double*>(elemPtr) = lua_tonumber(L, valueIdx);
+        return true;
+    case Il2CppTypeEnum::TYPE_I:
+    case Il2CppTypeEnum::TYPE_U:
+        *reinterpret_cast<intptr_t*>(elemPtr) = static_cast<intptr_t>(lua_tointeger(L, valueIdx));
+        return true;
+    case Il2CppTypeEnum::TYPE_STRING:
+    {
+        if (lua_isnil(L, valueIdx)) *reinterpret_cast<Il2CppString**>(elemPtr) = nullptr;
+        else
+        {
+            const char* str = lua_tostring(L, valueIdx);
+            *reinterpret_cast<Il2CppString**>(elemPtr) = resolver.StringNew(str ? str : "");
+        }
+        return true;
+    }
+    case Il2CppTypeEnum::TYPE_CLASS:
+    case Il2CppTypeEnum::TYPE_OBJECT:
+    case Il2CppTypeEnum::TYPE_SZARRAY:
+    case Il2CppTypeEnum::TYPE_ARRAY:
+    {
+        if (lua_isnil(L, valueIdx)) *reinterpret_cast<Il2CppObject**>(elemPtr) = nullptr;
+        else
+        {
+            LuaInstanceUD* valUD = LuaBridge_CheckInstance(L, valueIdx);
+            if (valUD == nullptr) return false;
+            *reinterpret_cast<Il2CppObject**>(elemPtr) = valUD->obj;
+        }
+        return true;
+    }
+    case Il2CppTypeEnum::TYPE_VALUETYPE:
+    {
+        if (lua_islightuserdata(L, valueIdx))
+        {
+            // 直接拷贝用户提供的原始结构体内存
+            memcpy(elemPtr, lua_touserdata(L, valueIdx), elemSize);
+        }
+        else if (lua_isnil(L, valueIdx))
+        {
+            memset(elemPtr, 0, elemSize);
+        }
+        else
+        {
+            // 已装箱的值类型 拆箱后拷贝
+            LuaInstanceUD* valUD = LuaBridge_CheckInstance(L, valueIdx);
+            if (valUD == nullptr || valUD->obj == nullptr) return false;
+            void* unboxed = resolver.Unbox(valUD->obj);
+            if (unboxed == nullptr) return false;
+            memcpy(elemPtr, unboxed, elemSize);
+        }
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+// ============================================================
+// 字段值缓冲区大小辅助
+// ============================================================
+
+// 计算 il2cpp_field_get_value 所需的缓冲区大小
+// 引用类型/基本类型按固定大小 结构体通过 class_value_size 获取实际大小
+// 无法确定大小时回退 16 字节（保持旧行为）
+static size_t LuaBridge_GetFieldValueSize(const Il2CppType* fieldType, int32_t typeEnum)
+{
+    auto& resolver = Il2CppResolver::Instance();
+
+    switch (typeEnum)
+    {
+    case Il2CppTypeEnum::TYPE_BOOLEAN:
+    case Il2CppTypeEnum::TYPE_I1:
+    case Il2CppTypeEnum::TYPE_U1:
+        return 1;
+    case Il2CppTypeEnum::TYPE_CHAR:
+    case Il2CppTypeEnum::TYPE_I2:
+    case Il2CppTypeEnum::TYPE_U2:
+        return 2;
+    case Il2CppTypeEnum::TYPE_I4:
+    case Il2CppTypeEnum::TYPE_U4:
+    case Il2CppTypeEnum::TYPE_R4:
+        return 4;
+    case Il2CppTypeEnum::TYPE_I8:
+    case Il2CppTypeEnum::TYPE_U8:
+    case Il2CppTypeEnum::TYPE_R8:
+    case Il2CppTypeEnum::TYPE_I:
+    case Il2CppTypeEnum::TYPE_U:
+        return 8;
+    case Il2CppTypeEnum::TYPE_STRING:
+    case Il2CppTypeEnum::TYPE_CLASS:
+    case Il2CppTypeEnum::TYPE_OBJECT:
+    case Il2CppTypeEnum::TYPE_SZARRAY:
+    case Il2CppTypeEnum::TYPE_ARRAY:
+        return sizeof(void*);
+    case Il2CppTypeEnum::TYPE_VALUETYPE:
+    {
+        Il2CppClass* valueKlass = resolver.GetClassFromType(fieldType);
+        if (valueKlass != nullptr)
+        {
+            uint32_t align = 0;
+            int32_t size = resolver.ClassValueSize(valueKlass, &align);
+            if (size > 0) return static_cast<size_t>(size);
+        }
+        // 无法获取大小时回退 16 字节
+        return 16;
+    }
+    default:
+        // 未知类型回退 16 字节（与旧固定缓冲区一致）
+        return 16;
+    }
 }
 
 // ============================================================
@@ -766,11 +1154,21 @@ static int Il2Cpp_FindObjects(lua_State* L)
 }
 
 // il2cpp 全局表的函数注册表
+// il2cpp.unhook_all()
+// 卸载全部已安装的方法 Hook
+static int Il2Cpp_UnhookAll(lua_State* L)
+{
+    Il2CppHook::UnhookAll();
+    return 0;
+}
+
+// il2cpp 全局表的函数注册表
 static const luaL_Reg il2cpp_funcs[] = {
     {"get_status", Il2Cpp_GetStatus},          // 产看解析导出函数状态
     {"get_class", Il2Cpp_GetClass},            // 查找类
     {"get_assemblies", Il2Cpp_GetAssemblies},  // 获取程序集数量
     {"get_image_count", Il2Cpp_GetImageCount}, // 获取镜像数量
+    {"unhook_all", Il2Cpp_UnhookAll},          // 卸载全部 Hook
     {"is_initialized", Il2Cpp_IsInitialized},  // 检查初始化状态
     {"wrap", Il2Cpp_Wrap},                     // 裸指针包装
     {"find_objects", Il2Cpp_FindObjects},      // 查找对象
@@ -995,18 +1393,48 @@ static int Class_StaticGet(lua_State* L)
     const Il2CppField* field = resolver.GetField(ud->klass, name);
     if (field == nullptr) return luaL_error(L, "field not found: %s", name);
 
-    // 读取静态字段
-    uint8_t buffer[16] = {};
-    resolver.ReadStaticField(field, buffer);
-
     // 根据字段类型推送 Lua 值
     const Il2CppType* fieldType = resolver.GetFieldType(field);
     int32_t typeEnum = resolver.GetTypeEnum(fieldType);
+
+    // 按字段类型动态分配缓冲区
+    // 避免 Matrix4x4（64 字节）等大结构体超过固定 16 字节导致越界
+    std::vector<uint8_t> fieldStorage(LuaBridge_GetFieldValueSize(fieldType, typeEnum), 0);
+    uint8_t* buffer = fieldStorage.data();
+
+    // 读取静态字段
+    resolver.ReadStaticField(field, buffer);
 
     switch (typeEnum)
     {
     case Il2CppTypeEnum::TYPE_BOOLEAN:
         lua_pushboolean(L, *reinterpret_cast<bool*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_CHAR:
+        lua_pushinteger(L, *reinterpret_cast<uint16_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_I1:
+        lua_pushinteger(L, *reinterpret_cast<int8_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_I2:
+        lua_pushinteger(L, *reinterpret_cast<int16_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_U1:
+        lua_pushinteger(L, *reinterpret_cast<uint8_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_U2:
+        lua_pushinteger(L, *reinterpret_cast<uint16_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_U4:
+        lua_pushinteger(L, *reinterpret_cast<uint32_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_U8:
+        // lua_Integer 为有符号 64 位 超过 INT64_MAX 的值会回绕
+        lua_pushinteger(L, static_cast<lua_Integer>(*reinterpret_cast<uint64_t*>(buffer)));
+        break;
+    case Il2CppTypeEnum::TYPE_I:
+    case Il2CppTypeEnum::TYPE_U:
+        lua_pushinteger(L, static_cast<lua_Integer>(*reinterpret_cast<intptr_t*>(buffer)));
         break;
     case Il2CppTypeEnum::TYPE_I4:
         lua_pushinteger(L, *reinterpret_cast<int32_t*>(buffer));
@@ -1023,13 +1451,22 @@ static int Class_StaticGet(lua_State* L)
     case Il2CppTypeEnum::TYPE_STRING:
     {
         Il2CppString* str = *reinterpret_cast<Il2CppString**>(buffer);
-        if (str != nullptr) PushIl2CppString(L, str);
+        if (str != nullptr) LuaBridge_PushString(L, str);
         else lua_pushnil(L);
+        break;
+    }
+    case Il2CppTypeEnum::TYPE_VALUETYPE:
+    {
+        // 值类型字段：buffer 中是原始值字节 需要先装箱再包装为 Instance
+        // 缓冲区已按 value_size 动态分配 可容纳任意大小结构体
+        Il2CppClass* valueKlass = resolver.GetClassFromType(fieldType);
+        Il2CppObject* boxed = (valueKlass != nullptr) ? resolver.Box(valueKlass, buffer) : nullptr;
+        LuaBridge_PushInstance(L, boxed, valueKlass);
         break;
     }
     default:       
     {
-        // 引用类型或值类型
+        // 引用类型字段（class / object / array）
         Il2CppObject* obj = *reinterpret_cast<Il2CppObject**>(buffer);
         LuaBridge_PushInstance(L, obj, nullptr);
         break;
@@ -1056,7 +1493,12 @@ static int Class_StaticSet(lua_State* L)
 
     if (!MarshalArg(L, 3, fieldType, buffer, param)) return luaL_error(L, "failed to marshal field value");
 
-    resolver.WriteStaticField(field, buffer);
+    // 引用类型字段：buffer 中保存的是对象指针
+    // field_set 系列需要“指向指针的指针”（即 buffer）
+    // 值类型/基本类型字段：param 直接指向值数据 结构体可能超过 16 字节
+    int32_t typeEnum = resolver.GetTypeEnum(fieldType);
+    if (IsRefType(typeEnum)) resolver.WriteStaticField(field, buffer);
+    else resolver.WriteStaticField(field, param);
     return 0;
 }
 
@@ -1096,6 +1538,15 @@ static int Class_GetInstanceSize(lua_State* L)
     return 1;
 }
 
+// cls:get_address() → number
+// 返回 Il2CppClass* 的原始地址
+static int Class_GetAddress(lua_State* L)
+{
+    LuaClassUD* ud = static_cast<LuaClassUD*>(luaL_checkudata(L, 1, LuaBridgeMT::CLASS));
+    lua_pushinteger(L, reinterpret_cast<int64_t>(ud->klass));
+    return 1;
+}
+
 // cls:__tostring() → string
 static int Class_ToString(lua_State* L)
 {
@@ -1103,7 +1554,7 @@ static int Class_ToString(lua_State* L)
     auto& resolver = Il2CppResolver::Instance();
     const char* ns = resolver.GetClassNamespace(ud->klass);
     const char* name = resolver.GetKlassName(ud->klass);
-    lua_pushfstring(L, "Class: %s.%s", ns ? ns : "", name ? name : "?");
+    lua_pushfstring(L, "Class: %s.%s @ 0x%p", ns ? ns : "", name ? name : "?", ud->klass);
     return 1;
 }
 
@@ -1122,6 +1573,7 @@ static const luaL_Reg class_methods[] = {
     {"static_set",        Class_StaticSet},
     {"find_objects",      Class_FindObjects},
     {"get_instance_size", Class_GetInstanceSize},
+    {"get_address",       Class_GetAddress},
     {"__tostring",        Class_ToString},
     {nullptr, nullptr}
 };
@@ -1165,18 +1617,47 @@ static int Instance_Get(lua_State* L)
     const Il2CppField* field = resolver.GetField(klass, name);
     if (field == nullptr) return luaL_error(L, "field not found: %s", name);
 
-    // 读取字段值
-    uint8_t buffer[16] = {};
-    resolver.ReadField(ud->obj, field, buffer);
-
     // 根据字段类型推送 Lua 值
     const Il2CppType* fieldType = resolver.GetFieldType(field);
     int32_t typeEnum = resolver.GetTypeEnum(fieldType);
+
+    // 按字段类型动态分配缓冲区 避免大结构体越界
+    std::vector<uint8_t> fieldStorage(LuaBridge_GetFieldValueSize(fieldType, typeEnum), 0);
+    uint8_t* buffer = fieldStorage.data();
+
+    // 读取字段值
+    resolver.ReadField(ud->obj, field, buffer);
 
     switch (typeEnum)
     {
     case Il2CppTypeEnum::TYPE_BOOLEAN:
         lua_pushboolean(L, *reinterpret_cast<bool*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_CHAR:
+        lua_pushinteger(L, *reinterpret_cast<uint16_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_I1:
+        lua_pushinteger(L, *reinterpret_cast<int8_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_I2:
+        lua_pushinteger(L, *reinterpret_cast<int16_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_U1:
+        lua_pushinteger(L, *reinterpret_cast<uint8_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_U2:
+        lua_pushinteger(L, *reinterpret_cast<uint16_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_U4:
+        lua_pushinteger(L, *reinterpret_cast<uint32_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_U8:
+        // lua_Integer 为有符号 64 位 超过 INT64_MAX 的值会回绕
+        lua_pushinteger(L, static_cast<lua_Integer>(*reinterpret_cast<uint64_t*>(buffer)));
+        break;
+    case Il2CppTypeEnum::TYPE_I:
+    case Il2CppTypeEnum::TYPE_U:
+        lua_pushinteger(L, static_cast<lua_Integer>(*reinterpret_cast<intptr_t*>(buffer)));
         break;
     case Il2CppTypeEnum::TYPE_I4:
         lua_pushinteger(L, *reinterpret_cast<int32_t*>(buffer));
@@ -1193,12 +1674,22 @@ static int Instance_Get(lua_State* L)
     case Il2CppTypeEnum::TYPE_STRING:
     {
         Il2CppString* str = *reinterpret_cast<Il2CppString**>(buffer);
-        if (str != nullptr) PushIl2CppString(L, str);
+        if (str != nullptr) LuaBridge_PushString(L, str);
         else lua_pushnil(L);
+        break;
+    }
+    case Il2CppTypeEnum::TYPE_VALUETYPE:
+    {
+        // 值类型字段：buffer 中是原始值字节 需要先装箱再包装为 Instance
+        // 缓冲区已按 value_size 动态分配 可容纳任意大小结构体
+        Il2CppClass* valueKlass = resolver.GetClassFromType(fieldType);
+        Il2CppObject* boxed = (valueKlass != nullptr) ? resolver.Box(valueKlass, buffer) : nullptr;
+        LuaBridge_PushInstance(L, boxed, valueKlass);
         break;
     }
     default:
     {
+        // 引用类型字段（class / object / array）
         Il2CppObject* obj = *reinterpret_cast<Il2CppObject**>(buffer);
         LuaBridge_PushInstance(L, obj, nullptr);
         break;
@@ -1228,7 +1719,10 @@ static int Instance_Set(lua_State* L)
 
     if (!MarshalArg(L, 3, fieldType, buffer, param)) return luaL_error(L, "failed to marshal field value");
 
-    resolver.WriteField(ud->obj, field, buffer);
+    // 同 static_set：引用类型字段传 buffer 值类型/基本类型字段传 param
+    int32_t typeEnum = resolver.GetTypeEnum(fieldType);
+    if (IsRefType(typeEnum)) resolver.WriteField(ud->obj, field, buffer);
+    else resolver.WriteField(ud->obj, field, param);
     return 0;
 }
 
@@ -1285,12 +1779,11 @@ static int Instance_Index(lua_State* L)
         uint64_t len = LuaBridge_GetArrayLength(ud->obj);
         if (idx < 0 || static_cast<uint64_t>(idx) >= len) return luaL_error(L, "array index out of bounds: %d", static_cast<int>(idx + 1));
 
-        // 读取数组元素
-        // 对于引用类型数组 元素是指针 (8 字节)
-        // 数组数据起始地址 = arr + 0x20
-        uint8_t* dataBase = reinterpret_cast<uint8_t*>(ud->obj) + ARRAY_DATA_OFFSET;
-        Il2CppObject* elem = READ_OFFSET(dataBase, idx * sizeof(void*), Il2CppObject*)[0];
-        LuaBridge_PushInstance(L, elem, nullptr);
+        // 读取数组元素（按元素实际类型与大小处理）
+        if (!LuaBridge_PushArrayElement(L, ud->obj, idx))
+        {
+            return luaL_error(L, "unsupported array element type");
+        }
         return 1;
     }
 
@@ -1317,18 +1810,10 @@ static int Instance_NewIndex(lua_State* L)
         uint64_t len = LuaBridge_GetArrayLength(ud->obj);
         if (idx < 0 || static_cast<uint64_t>(idx) >= len) return luaL_error(L, "array index out of bounds: %d", static_cast<int>(idx + 1));
 
-        // 计算元素地址
-        uint8_t* dataBase = reinterpret_cast<uint8_t*>(ud->obj) + ARRAY_DATA_OFFSET;
-        void* elemPtr = dataBase + idx * sizeof(void*);
-
-        // 将 Lua 值写入数组元素
-        // 对于引用类型数组 直接写入指针
-        if (lua_isnil(L, 3)) *static_cast<Il2CppObject**>(elemPtr) = nullptr;
-        else
+        // 写入数组元素（按元素实际类型与大小处理）
+        if (!LuaBridge_SetArrayElement(L, ud->obj, idx, 3))
         {
-            LuaInstanceUD* valUD = LuaBridge_CheckInstance(L, 3);
-            if (valUD != nullptr) *static_cast<Il2CppObject**>(elemPtr) = valUD->obj;
-            else return luaL_error(L, "can only assign Instance or nil to array element");
+            return luaL_error(L, "failed to set array element");
         }
         return 0;
     }
@@ -1353,6 +1838,48 @@ static int Instance_Len(lua_State* L)
     return 1;
 }
 
+// obj:each(function(value, index) ... end)
+// 数组遍历: 从 1 到数组长度逐个取出元素调用回调
+// 回调参数与 arr[i] 语义一致 索引从 1 开始（C# 下标 = index - 1）
+static int Instance_Each(lua_State* L)
+{
+    LuaInstanceUD* ud = static_cast<LuaInstanceUD*>(luaL_checkudata(L, 1, LuaBridgeMT::INSTANCE));
+    if (ud->obj == nullptr) return luaL_error(L, "instance is null");
+
+    // 仅数组支持遍历
+    if (!LuaBridge_IsArray(ud->obj)) return luaL_error(L, "object is not an array");
+
+    // 回调必须是函数
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+
+    // 获取数组长度
+    uint64_t len = LuaBridge_GetArrayLength(ud->obj);
+
+    // 逐个元素调用回调
+    for (uint64_t i = 0; i < len; ++i)
+    {
+        // 读取数组元素压栈（与 obj[i] 使用同一套编组）
+        if (!LuaBridge_PushArrayElement(L, ud->obj, static_cast<int64_t>(i)))
+        {
+            return luaL_error(L, "unsupported array element type at index %llu", static_cast<unsigned long long>(i));
+        }
+
+        // 压入回调函数与 Lua 索引（从 1 开始）
+        lua_pushvalue(L, 2);
+        lua_pushinteger(L, static_cast<lua_Integer>(i + 1));
+
+        // 调用 callback(value, index)
+        int status = lua_pcall(L, 2, 0, 0);
+        if (status != LUA_OK)
+        {
+            const char* err = lua_tostring(L, -1);
+            lua_pop(L, 1);
+            return luaL_error(L, "array each callback error: %s", err ? err : "(non-string error)");
+        }
+    }
+    return 0;
+}
+
 // Instance 元表方法注册表
 static const luaL_Reg instance_methods[] = {
     {"call",         Instance_Call},
@@ -1360,6 +1887,7 @@ static const luaL_Reg instance_methods[] = {
     {"set",          Instance_Set},
     {"get_class",    Instance_GetClass},
     {"get_address",  Instance_GetAddress},
+    {"each",         Instance_Each},
     {"__tostring",   Instance_ToString},
     {"__index",      Instance_Index},
     {"__newindex",   Instance_NewIndex},
@@ -1634,6 +2162,68 @@ static int Method_Ovload(lua_State* L)
     return luaL_error(L, "no matching overload found for %s with %d args", methodName, typeArgCount);
 }
 
+// ============================================================
+// Method Hook（参考 frida-il2cpp-bridge 的 implementation / revert）
+// ============================================================
+
+// mth:hook(function(this, original, ...) ... end)
+// 替换方法实现 回调签名:
+// ·实例方法: function(this, original, 参数1, ...) ... return 返回值 end
+// ·静态方法: function(Class, original, 参数1, ...) ... end
+// ·original() 调用原方法（可传替换参数）并返回原方法返回值
+// ·不调用 original 时 回调返回值直接作为方法返回值
+static int Method_Hook(lua_State* L)
+{
+    LuaMethodUD* ud = static_cast<LuaMethodUD*>(luaL_checkudata(L, 1, LuaBridgeMT::METHOD));
+    auto& resolver = Il2CppResolver::Instance();
+
+    if (lua_type(L, 2) != LUA_TFUNCTION)
+    {
+        return luaL_error(L, "hook requires a function");
+    }
+
+    if (!Il2CppHook::HookMethod(L, ud->method, ud->klass, 2))
+    {
+        const char* name = resolver.GetMethodName(ud->method);
+        return luaL_error(L, "failed to hook method: %s", name ? name : "?");
+    }
+    return 0;
+}
+
+// mth:unhook()
+// 恢复原始实现
+static int Method_Unhook(lua_State* L)
+{
+    LuaMethodUD* ud = static_cast<LuaMethodUD*>(luaL_checkudata(L, 1, LuaBridgeMT::METHOD));
+
+    if (!Il2CppHook::UnhookMethod(ud->method))
+    {
+        return luaL_error(L, "method is not hooked");
+    }
+    return 0;
+}
+
+// mth:hooked() -> boolean
+// 查询是否已 Hook
+static int Method_Hooked(lua_State* L)
+{
+    LuaMethodUD* ud = static_cast<LuaMethodUD*>(luaL_checkudata(L, 1, LuaBridgeMT::METHOD));
+
+    lua_pushboolean(L, Il2CppHook::IsHooked(ud->method) ? 1 : 0);
+    return 1;
+}
+
+// mth:get_address() → number
+// 返回方法原生代码地址（MethodInfo 首字段 methodPointer 即 GameAssembly.dll 中的函数入口）
+// 与 frida-il2cpp-bridge 的 method.virtualAddress 对应
+static int Method_GetAddress(lua_State* L)
+{
+    LuaMethodUD* ud = static_cast<LuaMethodUD*>(luaL_checkudata(L, 1, LuaBridgeMT::METHOD));
+    auto& resolver = Il2CppResolver::Instance();
+    lua_pushinteger(L, reinterpret_cast<int64_t>(resolver.GetMethodPointer(ud->method)));
+    return 1;
+}
+
 // mth:__tostring() → string
 static int Method_ToString(lua_State* L)
 {
@@ -1642,7 +2232,8 @@ static int Method_ToString(lua_State* L)
     const char* name = resolver.GetMethodName(ud->method);
     int32_t pc = resolver.GetMethodParamCount(ud->method);
     bool isStatic = resolver.IsStaticMethod(ud->method);
-    lua_pushfstring(L, "Method: %s%s(%d params)", isStatic ? "static " : "", name ? name : "?", pc);
+    void* codeAddr = resolver.GetMethodPointer(ud->method);
+    lua_pushfstring(L, "Method: %s%s(%d params) @ 0x%p", isStatic ? "static " : "", name ? name : "?", pc, codeAddr);
     return 1;
 }
 
@@ -1655,6 +2246,10 @@ static const luaL_Reg method_methods[] = {
     {"is_static",      Method_IsStatic},
     {"call",           Method_Call},
     {"ovload",         Method_Ovload},
+    {"hook",           Method_Hook},
+    {"unhook",         Method_Unhook},
+    {"hooked",         Method_Hooked},
+    {"get_address",    Method_GetAddress},
     {"__tostring",     Method_ToString},
     {nullptr, nullptr}
 };
@@ -1701,7 +2296,11 @@ static int Field_Get(lua_State* L)
     LuaFieldUD* ud = static_cast<LuaFieldUD*>(luaL_checkudata(L, 1, LuaBridgeMT::FIELD));
     auto& resolver = Il2CppResolver::Instance();
 
-    uint8_t buffer[16] = {};
+    // 按字段类型动态分配缓冲区 避免大结构体越界
+    const Il2CppType* fieldType = resolver.GetFieldType(ud->field);
+    int32_t typeEnum = resolver.GetTypeEnum(fieldType);
+    std::vector<uint8_t> fieldStorage(LuaBridge_GetFieldValueSize(fieldType, typeEnum), 0);
+    uint8_t* buffer = fieldStorage.data();
 
     // 判断是实例字段还是静态字段
     if (lua_isnil(L, 2))
@@ -1717,14 +2316,36 @@ static int Field_Get(lua_State* L)
         resolver.ReadField(instUD->obj, ud->field, buffer);
     }
 
-    // 根据字段类型推送 Lua 值
-    const Il2CppType* fieldType = resolver.GetFieldType(ud->field);
-    int32_t typeEnum = resolver.GetTypeEnum(fieldType);
-
     switch (typeEnum)
     {
     case Il2CppTypeEnum::TYPE_BOOLEAN:
         lua_pushboolean(L, *reinterpret_cast<bool*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_CHAR:
+        lua_pushinteger(L, *reinterpret_cast<uint16_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_I1:
+        lua_pushinteger(L, *reinterpret_cast<int8_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_I2:
+        lua_pushinteger(L, *reinterpret_cast<int16_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_U1:
+        lua_pushinteger(L, *reinterpret_cast<uint8_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_U2:
+        lua_pushinteger(L, *reinterpret_cast<uint16_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_U4:
+        lua_pushinteger(L, *reinterpret_cast<uint32_t*>(buffer));
+        break;
+    case Il2CppTypeEnum::TYPE_U8:
+        // lua_Integer 为有符号 64 位 超过 INT64_MAX 的值会回绕
+        lua_pushinteger(L, static_cast<lua_Integer>(*reinterpret_cast<uint64_t*>(buffer)));
+        break;
+    case Il2CppTypeEnum::TYPE_I:
+    case Il2CppTypeEnum::TYPE_U:
+        lua_pushinteger(L, static_cast<lua_Integer>(*reinterpret_cast<intptr_t*>(buffer)));
         break;
     case Il2CppTypeEnum::TYPE_I4:
         lua_pushinteger(L, *reinterpret_cast<int32_t*>(buffer));
@@ -1741,12 +2362,22 @@ static int Field_Get(lua_State* L)
     case Il2CppTypeEnum::TYPE_STRING:
     {
         Il2CppString* str = *reinterpret_cast<Il2CppString**>(buffer);
-        if (str != nullptr) PushIl2CppString(L, str);
+        if (str != nullptr) LuaBridge_PushString(L, str);
         else lua_pushnil(L);
+        break;
+    }
+    case Il2CppTypeEnum::TYPE_VALUETYPE:
+    {
+        // 值类型字段：buffer 中是原始值字节 需要先装箱再包装为 Instance
+        // 缓冲区已按 value_size 动态分配 可容纳任意大小结构体
+        Il2CppClass* valueKlass = resolver.GetClassFromType(fieldType);
+        Il2CppObject* boxed = (valueKlass != nullptr) ? resolver.Box(valueKlass, buffer) : nullptr;
+        LuaBridge_PushInstance(L, boxed, valueKlass);
         break;
     }
     default:
     {
+        // 引用类型字段（class / object / array）
         Il2CppObject* obj = *reinterpret_cast<Il2CppObject**>(buffer);
         LuaBridge_PushInstance(L, obj, nullptr);
         break;
@@ -1769,16 +2400,22 @@ static int Field_Set(lua_State* L)
     // 编组值
     if (!MarshalArg(L, 3, fieldType, buffer, param)) return luaL_error(L, "failed to marshal field value");
 
+    // 引用类型字段：buffer 中保存的是对象指针
+    // 值类型/基本类型字段：param 直接指向值数据
+    int32_t typeEnum = resolver.GetTypeEnum(fieldType);
+
     // 判断是实例字段还是静态字段
     if (lua_isnil(L, 2))
     {
-        resolver.WriteStaticField(ud->field, buffer);
+        if (IsRefType(typeEnum)) resolver.WriteStaticField(ud->field, buffer);
+        else resolver.WriteStaticField(ud->field, param);
     }
     else
     {
         LuaInstanceUD* instUD = LuaBridge_CheckInstance(L, 2);
         if (instUD == nullptr) return luaL_error(L, "expected Instance or nil");
-        resolver.WriteField(instUD->obj, ud->field, buffer);
+        if (IsRefType(typeEnum)) resolver.WriteField(instUD->obj, ud->field, buffer);
+        else resolver.WriteField(instUD->obj, ud->field, param);
     }
 
     return 0;

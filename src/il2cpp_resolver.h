@@ -52,6 +52,15 @@ public:
     bool IsNoFailedFunctions() const { return m_failedFunctions.empty(); }
 
     // ========================================================
+    // 线程与原生方法
+    // ========================================================
+    // 将当前线程附加到 IL2CPP 运行时
+    // Hook 回调可能发生在任意游戏线程 调用 IL2CPP API 前必须先附加
+    Il2CppThread* AttachThread() const;
+    // 读取 MethodInfo 中的原生函数指针（methodPointer，始终位于 offset 0x00）
+    void* GetMethodPointer(const Il2CppMethod* method) const;
+
+    // ========================================================
     // 解析导出函数的结果
     // ========================================================
     std::string GetResolveStatus() const;
@@ -157,6 +166,10 @@ public:
     const char* GetTypeName(const Il2CppType* type) const;
     // 从 Il2CppType 获取对应的 Il2CppClass
     Il2CppClass* GetClassFromType(const Il2CppType* type) const;
+    // 获取数组类的元素类型（仅数组类有效）
+    Il2CppClass* GetElementClass(Il2CppClass* klass) const;
+    // 获取值类型的实际大小（字节）
+    int32_t ClassValueSize(Il2CppClass* klass, uint32_t* align) const;
     // 从 Il2CppType 获取 System.Type 托管对象（用于 FindObjectsOfType）
     Il2CppObject* GetTypeObject(const Il2CppType* type) const;
 
@@ -164,7 +177,7 @@ public:
     // 数组
     // ========================================================
     // 创建一维零基数组
-    Il2CppArray*  ArrayNew(Il2CppClass* elementClass, uint64_t length) const;
+    Il2CppArray*  ArrayNew(Il2CppClass* elementClass, uint32_t length) const;
     // 读取数组长度（直接从内存布局读取）
     uint64_t ArrayLength(Il2CppArray* arr) const;
 
@@ -215,6 +228,8 @@ private:
     typedef Il2CppClass* (*pfn_class_get_parent)(Il2CppClass*);
     typedef int32_t (*pfn_class_instance_size)(Il2CppClass*);
     typedef const Il2CppType* (*pfn_class_get_type)(Il2CppClass*);
+    typedef Il2CppClass* (*pfn_class_get_element_class)(Il2CppClass*);
+    typedef int32_t (*pfn_class_value_size)(Il2CppClass*, uint32_t*);
 
     // --- 方法 ---
     typedef Il2CppClass* (*pfn_method_get_class)(const Il2CppMethod*);
@@ -224,7 +239,8 @@ private:
     typedef int32_t (*pfn_method_get_param_count)(const Il2CppMethod*);
     typedef const Il2CppType* (*pfn_method_get_return_type)(const Il2CppMethod*);
     typedef const Il2CppType* (*pfn_method_get_param)(const Il2CppMethod*, int);
-    typedef uint32_t (*pfn_method_get_flags)(const Il2CppMethod*, uint16_t*);
+    // 官方签名: uint32_t il2cpp_method_get_flags(const MethodInfo*, uint32_t* iflags)
+    typedef uint32_t (*pfn_method_get_flags)(const Il2CppMethod*, uint32_t*);
 
     // --- 字段 ---
     typedef const Il2CppField* (*pfn_class_get_field_from_name)(Il2CppClass*, const char*);
@@ -260,7 +276,8 @@ private:
     typedef Il2CppObject* (*pfn_type_get_object)(const Il2CppType*);
 
     // --- 数组 ---
-    typedef Il2CppArray* (*pfn_array_new)(Il2CppClass*, uint64_t);
+    // 官方签名的长度参数类型为 il2cpp_array_size_t（即 uint32_t）
+    typedef Il2CppArray* (*pfn_array_new)(Il2CppClass*, uint32_t);
 
     // ========================================================
     // 函数指针成员
@@ -276,6 +293,8 @@ private:
     pfn_class_get_parent m_class_get_parent = nullptr;
     pfn_class_instance_size m_class_instance_size = nullptr;
     pfn_class_get_type m_class_get_type = nullptr;
+    pfn_class_get_element_class m_class_get_element_class = nullptr;
+    pfn_class_value_size m_class_value_size = nullptr;
     pfn_method_get_class m_method_get_class = nullptr;
     pfn_class_get_method_from_name m_class_get_method_from_name = nullptr;
     pfn_class_get_methods m_class_get_methods = nullptr;

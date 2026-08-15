@@ -149,7 +149,7 @@ void LuaEngine::Shutdown()
     if (!m_initialized) return;
 
     // 加锁保护关闭过程
-    std::lock_guard<std::mutex> lock(m_luaMutex);
+    std::lock_guard<std::recursive_mutex> lock(m_luaMutex);
 
     // 关闭 Lua 状态机
     if (m_L != nullptr)
@@ -179,7 +179,7 @@ bool LuaEngine::ExecuteBuffer(const char* buff, size_t size, const char* name)
     int baseline = lua_gettop(m_L);
 
     // 锁定 Lua 状态机（RAII 执行完自动释放）
-    std::unique_lock<std::mutex> luaLock(m_luaMutex);
+    std::unique_lock<std::recursive_mutex> luaLock(m_luaMutex);
 
     // SEH 安全执行
     int status = SEHSafeLoadAndCall(m_L, buff, size, name);
