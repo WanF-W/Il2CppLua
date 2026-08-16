@@ -986,6 +986,226 @@ static bool LuaBridge_SetArrayElement(lua_State* L, Il2CppObject* arr, int64_t i
 }
 
 // ============================================================
+// 通用遍历辅助（数组 / List<T> / Lua 表）
+// ============================================================
+// 供 obj:each、il2cpp.each、il2cpp.dump 共用
+// 回调签名统一为 function(value, index) 索引从 1 开始
+
+// 判断 Instance 是否为 System.Collections.Generic.List<T>
+static bool LuaBridge_IsList(Il2CppObject* obj, Il2CppClass* klass)
+{
+    if (obj == nullptr) return false;
+
+    auto& resolver = Il2CppResolver::Instance();
+    if (klass == nullptr) klass = READ_OFFSET(obj, 0, Il2CppClass*)[0];
+    if (klass == nullptr) return false;
+
+    const char* name = resolver.GetKlassName(klass);
+    const char* ns = resolver.GetClassNamespace(klass);
+    return name != nullptr && ns != nullptr
+        && strcmp(name, "List`1") == 0
+        && strcmp(ns, "System.Collections.Generic") == 0;
+}
+
+// 获取 List<T> 元素个数（失败返回 -1）
+static int64_t LuaBridge_GetListCount(Il2CppObject* list, Il2CppClass* klass)
+{
+    if (list == nullptr) return -1;
+
+    auto& resolver = Il2CppResolver::Instance();
+    if (klass == nullptr) klass = READ_OFFSET(list, 0, Il2CppClass*)[0];
+    if (klass == nullptr) return -1;
+
+    const Il2CppMethod* getCount = resolver.GetMethod(klass, "get_Count");
+    if (getCount == nullptr) return -1;
+
+    Il2CppException* exc = nullptr;
+    Il2CppObject* result = resolver.RuntimeInvoke(getCount, list, nullptr, &exc);
+    if (exc != nullptr || result == nullptr) return -1;
+
+    const Il2CppType* retType = resolver.GetMethodReturnType(getCount);
+    int32_t enumv = retType ? resolver.GetTypeEnum(retType) : 0;
+    void* data = resolver.Unbox(result);
+    if (data == nullptr) return -1;
+
+    switch (enumv)
+    {
+    case Il2CppTypeEnum::TYPE_I4: return *static_cast<int32_t*>(data);
+    case Il2CppTypeEnum::TYPE_U4: return *static_cast<uint32_t*>(data);
+    case Il2CppTypeEnum::TYPE_I8: return *static_cast<int64_t*>(data);
+    case Il2CppTypeEnum::TYPE_U8: return static_cast<int64_t>(*static_cast<uint64_t*>(data));
+    default: return -1;
+    }
+}
+
+// 遍历 IL2CPP 数组: 对每个元素调用 fn(value, index)
+static void LuaBridge_EachArray(lua_State* L, Il2CppObject* arr, int fnIdx, int64_t& outCount)
+{
+    uint64_t len = LuaBridge_GetArrayLength(arr);
+    outCount = static_cast<int64_t>(len);
+
+    for (uint64_t i = 0; i < len; ++i)
+    {
+        // 读取数组元素压栈（与 obj[i] 使用同一套编组）
+        if (!LuaBridge_PushArrayElement(L, arr, static_cast<int64_t>(i)))
+        {
+            luaL_error(L, "unsupported array element type at index %llu", static_cast<unsigned long long>(i));
+            return;
+        }
+
+        // 调用 fn(value, index)
+        lua_pushvalue(L, fnIdx);
+        lua_pushvalue(L, -2);
+        lua_pushinteger(L, static_cast<lua_Integer>(i) + 1);
+        int status = lua_pcall(L, 2, 0, 0);
+        if (status != LUA_OK)
+        {
+            const char* err = lua_tostring(L, -1);
+            char errBuf[512];
+            snprintf(errBuf, sizeof(errBuf), "each callback error: %s", err ? err : "(non-string error)");
+            lua_pop(L, 1);      // 错误
+            lua_pop(L, 1);      // value
+            luaL_error(L, "%s", errBuf);
+            return;
+        }
+        lua_pop(L, 1);          // value
+    }
+}
+
+// 遍历 List<T>: 通过 get_Count / get_Item 逐个取出元素调用 fn(value, index)
+static void LuaBridge_EachList(lua_State* L, Il2CppObject* list, Il2CppClass* klass, int fnIdx, int64_t& outCount)
+{
+    auto& resolver = Il2CppResolver::Instance();
+    if (klass == nullptr) klass = READ_OFFSET(list, 0, Il2CppClass*)[0];
+    if (klass == nullptr)
+    {
+        luaL_error(L, "cannot determine class for List");
+        return;
+    }
+
+    const Il2CppMethod* getCount = resolver.GetMethod(klass, "get_Count");
+    const Il2CppMethod* getItem = resolver.GetMethod(klass, "get_Item");
+    if (getCount == nullptr || getItem == nullptr)
+    {
+        luaL_error(L, "List get_Count/get_Item not found");
+        return;
+    }
+
+    int64_t count = LuaBridge_GetListCount(list, klass);
+    if (count < 0)
+    {
+        luaL_error(L, "failed to get List count");
+        return;
+    }
+    outCount = count;
+
+    for (int64_t i = 0; i < count; ++i)
+    {
+        // 调用 get_Item(i) 取出元素
+        int32_t idx = static_cast<int32_t>(i);
+        void* args[1] = { &idx };
+        Il2CppException* exc = nullptr;
+        Il2CppObject* elem = resolver.RuntimeInvoke(getItem, list, args, &exc);
+        if (exc != nullptr)
+        {
+            luaL_error(L, "List get_Item(%lld) threw a C# exception", static_cast<long long>(i));
+            return;
+        }
+
+        // 元素转 Lua 值（与 mth:call 使用同一套返回值转换）
+        const Il2CppType* retType = resolver.GetMethodReturnType(getItem);
+        LuaBridge_PushReturnValue(L, elem, retType);
+
+        // 调用 fn(value, index)
+        lua_pushvalue(L, fnIdx);
+        lua_pushvalue(L, -2);
+        lua_pushinteger(L, static_cast<lua_Integer>(i) + 1);
+        int status = lua_pcall(L, 2, 0, 0);
+        if (status != LUA_OK)
+        {
+            const char* err = lua_tostring(L, -1);
+            char errBuf[512];
+            snprintf(errBuf, sizeof(errBuf), "each callback error: %s", err ? err : "(non-string error)");
+            lua_pop(L, 1);      // 错误
+            lua_pop(L, 1);      // value
+            luaL_error(L, "%s", errBuf);
+            return;
+        }
+        lua_pop(L, 1);          // value
+    }
+}
+
+// 遍历 Lua 表: 先数组部分（1..# 保持顺序）再键值部分
+// 回调 fn(value, index_or_key)
+static int LuaBridge_EachTable(lua_State* L, int tblIdx, int fnIdx)
+{
+    luaL_checktype(L, tblIdx, LUA_TTABLE);
+    luaL_checktype(L, fnIdx, LUA_TFUNCTION);
+
+    lua_Integer len = lua_rawlen(L, tblIdx);
+
+    // 数组部分
+    for (lua_Integer i = 1; i <= len; ++i)
+    {
+        lua_rawgeti(L, tblIdx, i);
+        // 数组边界内出现空洞 跳过
+        if (lua_isnil(L, -1))
+        {
+            lua_pop(L, 1);
+            continue;
+        }
+
+        lua_pushvalue(L, fnIdx);
+        lua_pushvalue(L, -2);
+        lua_pushinteger(L, i);
+        if (lua_pcall(L, 2, 0, 0) != LUA_OK)
+        {
+            const char* err = lua_tostring(L, -1);
+            char errBuf[512];
+            snprintf(errBuf, sizeof(errBuf), "each callback error: %s", err ? err : "(non-string error)");
+            lua_pop(L, 1);      // 错误
+            lua_pop(L, 1);      // value
+            return luaL_error(L, "%s", errBuf);
+        }
+        lua_pop(L, 1);          // value
+    }
+
+    // 键值部分（跳过数组部分已遍历的整数键）
+    lua_pushnil(L);
+    while (lua_next(L, tblIdx) != 0)
+    {
+        // 栈: ... key value
+        bool skip = false;
+        if (lua_type(L, -2) == LUA_TNUMBER && lua_isinteger(L, -2))
+        {
+            lua_Integer k = lua_tointeger(L, -2);
+            if (k >= 1 && k <= len) skip = true;
+        }
+
+        if (!skip)
+        {
+            lua_pushvalue(L, fnIdx);
+            lua_pushvalue(L, -3);   // value
+            lua_pushvalue(L, -4);   // key
+            if (lua_pcall(L, 2, 0, 0) != LUA_OK)
+            {
+                const char* err = lua_tostring(L, -1);
+                char errBuf[512];
+                snprintf(errBuf, sizeof(errBuf), "each callback error: %s", err ? err : "(non-string error)");
+                lua_pop(L, 1);      // 错误
+                lua_pop(L, 1);      // value
+                lua_pop(L, 1);      // key
+                return luaL_error(L, "%s", errBuf);
+            }
+        }
+
+        // 弹出 value 保留 key 供 lua_next 继续遍历
+        lua_pop(L, 1);
+    }
+    return 0;
+}
+
+// ============================================================
 // 字段值缓冲区大小辅助
 // ============================================================
 
@@ -1153,6 +1373,174 @@ static int Il2Cpp_FindObjects(lua_State* L)
     return 1;
 }
 
+// ============================================================
+// il2cpp.each / il2cpp.dump（通用遍历）
+// ============================================================
+// 支持 Lua 表（get_methods / get_fields 等返回的结果表）
+// 以及 IL2CPP 数组、System.Collections.Generic.List<T> 实例
+// 回调签名统一为 function(value, index) 索引从 1 开始
+
+// il2cpp.each(container, fn) → 无返回值
+// 对容器中的每个元素调用 fn(value, index)
+static int Il2Cpp_Each(lua_State* L)
+{
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+
+    // Lua 表
+    if (lua_istable(L, 1)) return LuaBridge_EachTable(L, 1, 2);
+
+    // IL2CPP 数组 / List<T>
+    LuaInstanceUD* ud = LuaBridge_CheckInstance(L, 1);
+    if (ud != nullptr && ud->obj != nullptr)
+    {
+        if (LuaBridge_IsArray(ud->obj))
+        {
+            int64_t count = 0;
+            LuaBridge_EachArray(L, ud->obj, 2, count);
+            return 0;
+        }
+        if (LuaBridge_IsList(ud->obj, ud->klass))
+        {
+            int64_t count = 0;
+            LuaBridge_EachList(L, ud->obj, ud->klass, 2, count);
+            return 0;
+        }
+    }
+
+    return luaL_error(L, "each: expected table, array instance or List instance");
+}
+
+// il2cpp.dump 输出缓冲（固定大小 超出截断）
+struct DumpBuffer
+{
+    char data[262144];  // 256KB 足够打印绝大多数容器的全部元素
+    size_t len;
+};
+
+// 向 dump 缓冲追加格式化文本
+static void DumpAppend(DumpBuffer* buf, const char* fmt, ...)
+{
+    if (buf == nullptr || buf->len >= sizeof(buf->data)) return;
+
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf->data + buf->len, sizeof(buf->data) - buf->len, fmt, args);
+    va_end(args);
+    if (n <= 0) return;
+
+    size_t room = sizeof(buf->data) - buf->len;
+    buf->len += static_cast<size_t>(n) < room ? static_cast<size_t>(n) : room - 1;
+}
+
+// il2cpp.dump 的格式化回调: function(value, index) → 追加一行 "[index] = value"
+static int DumpFormatCallback(lua_State* L)
+{
+    DumpBuffer* buf = static_cast<DumpBuffer*>(lua_touserdata(L, lua_upvalueindex(1)));
+    if (buf == nullptr) return 0;
+
+    // 索引/键（整数或字符串）
+    std::string key;
+    if (lua_type(L, 2) == LUA_TNUMBER && lua_isinteger(L, 2))
+    {
+        key = std::to_string(static_cast<long long>(lua_tointeger(L, 2)));
+    }
+    else
+    {
+        size_t keyLen = 0;
+        const char* keyStr = luaL_tolstring(L, 2, &keyLen);
+        key.assign(keyStr ? keyStr : "?", keyStr ? keyLen : 1);
+        lua_pop(L, 1);  // tostring 结果
+    }
+
+    // 值（userdata 会走 __tostring 元方法）
+    size_t valLen = 0;
+    const char* valStr = luaL_tolstring(L, 1, &valLen);
+    DumpAppend(buf, "[%s] = %.*s\n", key.c_str(),
+        static_cast<int>(valLen), valStr ? valStr : "?");
+    lua_pop(L, 1);  // tostring 结果
+
+    return 0;
+}
+
+// il2cpp.dump(container) → 无返回值
+// 输出容器长度与每个元素 支持 Lua 表 / IL2CPP 数组 / List<T>
+// 其他值直接输出其字符串表示
+static int Il2Cpp_Dump(lua_State* L)
+{
+    // 非容器: 直接打印单个值（Method / Field / Class / 普通 Instance 等）
+    if (!lua_istable(L, 1))
+    {
+        LuaInstanceUD* ud = LuaBridge_CheckInstance(L, 1);
+        bool isContainer = (ud != nullptr && ud->obj != nullptr)
+            && (LuaBridge_IsArray(ud->obj) || LuaBridge_IsList(ud->obj, ud->klass));
+        if (!isContainer)
+        {
+            lua_getglobal(L, "print");
+            lua_pushvalue(L, 1);
+            lua_call(L, 1, 0);
+            return 0;
+        }
+    }
+
+    // 容器长度（先输出 再逐元素）
+    int64_t count = -1;
+    bool isTable = lua_istable(L, 1);
+    LuaInstanceUD* ud = nullptr;
+    if (isTable)
+    {
+        count = static_cast<int64_t>(lua_rawlen(L, 1));
+    }
+    else
+    {
+        ud = LuaBridge_CheckInstance(L, 1);
+        if (ud != nullptr && ud->obj != nullptr)
+        {
+            if (LuaBridge_IsArray(ud->obj))
+                count = static_cast<int64_t>(LuaBridge_GetArrayLength(ud->obj));
+            else if (LuaBridge_IsList(ud->obj, ud->klass))
+                count = LuaBridge_GetListCount(ud->obj, ud->klass);
+        }
+    }
+    if (count < 0)
+    {
+        return luaL_error(L, "dump: expected table, array instance or List instance");
+    }
+
+    // 输出缓冲作为回调闭包的 upvalue
+    DumpBuffer* buf = static_cast<DumpBuffer*>(lua_newuserdata(L, sizeof(DumpBuffer)));
+    buf->len = 0;
+    lua_pushcclosure(L, DumpFormatCallback, 1);
+    int fnIdx = lua_gettop(L);
+
+    DumpAppend(buf, "length: %lld\n", static_cast<long long>(count));
+
+    // 逐元素追加
+    if (isTable)
+    {
+        LuaBridge_EachTable(L, 1, fnIdx);
+    }
+    else if (ud != nullptr && ud->obj != nullptr)
+    {
+        if (LuaBridge_IsArray(ud->obj))
+        {
+            int64_t c = 0;
+            LuaBridge_EachArray(L, ud->obj, fnIdx, c);
+        }
+        else
+        {
+            int64_t c = 0;
+            LuaBridge_EachList(L, ud->obj, ud->klass, fnIdx, c);
+        }
+    }
+
+    // 一次性输出（走 print 同一输出通道）
+    lua_getglobal(L, "print");
+    lua_pushlstring(L, buf->data, buf->len);
+    lua_call(L, 1, 0);
+
+    return 0;
+}
+
 // il2cpp 全局表的函数注册表
 // il2cpp.unhook_all()
 // 卸载全部已安装的方法 Hook
@@ -1160,6 +1548,63 @@ static int Il2Cpp_UnhookAll(lua_State* L)
 {
     Il2CppHook::UnhookAll();
     return 0;
+}
+
+// ============================================================
+// il2cpp.mainThread 子表函数
+// ============================================================
+// 参考 frida-il2cpp-bridge 的 Il2Cpp.mainThread.schedule
+// schedule 只负责入队 由内部 tick hook 在 Unity 主线程取出来执行
+
+// il2cpp.mainThread.schedule(fn) → 无返回值
+// 把一个 Lua 函数加入主线程执行队列
+static int MainThread_Schedule(lua_State* L)
+{
+    if (!lua_isfunction(L, 1)) return luaL_error(L, "expected function as argument");
+
+    Il2CppHook::MainThreadSchedule(L, 1);
+    return 0;
+}
+
+// il2cpp.mainThread.set_tick(namespace, class, method) → boolean
+// 指定内部 tick 入口方法（游戏不调用默认入口时使用）
+static int MainThread_SetTick(lua_State* L)
+{
+    const char* ns = luaL_optstring(L, 1, "");
+    const char* klass = luaL_checkstring(L, 2);
+    const char* method = luaL_checkstring(L, 3);
+
+    bool ok = Il2CppHook::SetMainThreadTickTarget(ns, klass, method);
+    lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
+// il2cpp.mainThread.get_tick() → namespace, class, method | nil
+// 查询当前内部 tick 入口方法
+static int MainThread_GetTick(lua_State* L)
+{
+    std::string ns;
+    std::string klass;
+    std::string method;
+
+    if (!Il2CppHook::GetMainThreadTickTarget(ns, klass, method))
+    {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    lua_pushstring(L, ns.c_str());
+    lua_pushstring(L, klass.c_str());
+    lua_pushstring(L, method.c_str());
+    return 3;
+}
+
+// il2cpp.mainThread.is_ready() → boolean
+// 查询内部 tick hook 是否已安装
+static int MainThread_IsReady(lua_State* L)
+{
+    lua_pushboolean(L, Il2CppHook::IsMainThreadTickInstalled() ? 1 : 0);
+    return 1;
 }
 
 // il2cpp 全局表的函数注册表
@@ -1172,7 +1617,18 @@ static const luaL_Reg il2cpp_funcs[] = {
     {"is_initialized", Il2Cpp_IsInitialized},  // 检查初始化状态
     {"wrap", Il2Cpp_Wrap},                     // 裸指针包装
     {"find_objects", Il2Cpp_FindObjects},      // 查找对象
+    {"each", Il2Cpp_Each},                     // 通用遍历（表/数组/List）
+    {"dump", Il2Cpp_Dump},                     // 输出容器长度与全部元素
     {nullptr, nullptr}                         // 结束标记
+};
+
+// il2cpp.mainThread 子表的函数注册表
+static const luaL_Reg main_thread_funcs[] = {
+    {"schedule", MainThread_Schedule}, // 排队到主线程执行
+    {"set_tick", MainThread_SetTick},  // 指定内部 tick 入口方法
+    {"get_tick", MainThread_GetTick},  // 查询内部 tick 入口方法
+    {"is_ready", MainThread_IsReady},  // 查询内部 tick 是否已安装
+    {nullptr, nullptr}                 // 结束标记
 };
 
 // ============================================================
@@ -1367,15 +1823,242 @@ static int Class_New(lua_State* L)
     return 1;
 }
 
+// ============================================================
+// 重载方法选择（obj:call / cls:static_call 使用）
+// ============================================================
+// 按方法名 + 参数个数 + Lua 实参类型兼容性自动选择最佳重载
+// 避免同名重载方法总是命中第一个的问题
+//
+// 选择策略
+// ·同名且参数个数精确匹配的方法优先
+// ·多个匹配时按 Lua 实参类型打分 完全匹配 > 可转换 > 不兼容
+// ·没有任何参数个数匹配的重载时 回退到第一个同名方法（保持旧行为 由调用层报错）
+
+// 按 Lua 实参类型给单个方法打分（分数越高越匹配）
+static int ScoreMethodAgainstArgs(lua_State* L, const Il2CppMethod* method, int firstArgIdx)
+{
+    auto& resolver = Il2CppResolver::Instance();
+    int32_t paramCount = resolver.GetMethodParamCount(method);
+    int score = 0;
+
+    for (int32_t i = 0; i < paramCount; ++i)
+    {
+        const Il2CppType* paramType = resolver.GetMethodParamType(method, i);
+        if (paramType == nullptr) return INT32_MIN;
+
+        // ref/out 参数取目标类型
+        int32_t paramEnum = resolver.GetTypeEnum(paramType);
+        if (paramEnum == Il2CppTypeEnum::TYPE_BYREF)
+        {
+            Il2CppClass* targetClass = resolver.GetClassFromType(paramType);
+            const Il2CppType* targetType = targetClass ? resolver.GetClassType(targetClass) : nullptr;
+            if (targetType != nullptr) paramEnum = resolver.GetTypeEnum(targetType);
+        }
+
+        int argType = lua_type(L, firstArgIdx + i);
+        int local = -100;
+
+        switch (argType)
+        {
+        case LUA_TNIL:
+            // nil 可编组为引用类型 nullptr 或值类型 0 引用类型更匹配
+            if (IsRefType(paramEnum)
+                || paramEnum == Il2CppTypeEnum::TYPE_OBJECT
+                || paramEnum == Il2CppTypeEnum::TYPE_ARRAY)
+                local = 2;
+            else local = 1;
+            break;
+
+        case LUA_TBOOLEAN:
+            if (paramEnum == Il2CppTypeEnum::TYPE_BOOLEAN) local = 3;
+            break;
+
+        case LUA_TNUMBER:
+            if (lua_isinteger(L, firstArgIdx + i))
+            {
+                switch (paramEnum)
+                {
+                case Il2CppTypeEnum::TYPE_I4:
+                case Il2CppTypeEnum::TYPE_U4: local = 3; break;
+                case Il2CppTypeEnum::TYPE_I1:
+                case Il2CppTypeEnum::TYPE_I2:
+                case Il2CppTypeEnum::TYPE_I8:
+                case Il2CppTypeEnum::TYPE_U1:
+                case Il2CppTypeEnum::TYPE_U2:
+                case Il2CppTypeEnum::TYPE_U8:
+                case Il2CppTypeEnum::TYPE_I:
+                case Il2CppTypeEnum::TYPE_U:
+                case Il2CppTypeEnum::TYPE_CHAR: local = 2; break;
+                case Il2CppTypeEnum::TYPE_R4:
+                case Il2CppTypeEnum::TYPE_R8: local = 1; break;
+                default: break;
+                }
+            }
+            else
+            {
+                switch (paramEnum)
+                {
+                case Il2CppTypeEnum::TYPE_R4:
+                case Il2CppTypeEnum::TYPE_R8: local = 3; break;
+                case Il2CppTypeEnum::TYPE_I4:
+                case Il2CppTypeEnum::TYPE_I8:
+                case Il2CppTypeEnum::TYPE_U4:
+                case Il2CppTypeEnum::TYPE_U8:
+                case Il2CppTypeEnum::TYPE_I:
+                case Il2CppTypeEnum::TYPE_U: local = 1; break;
+                default: break;
+                }
+            }
+            break;
+
+        case LUA_TSTRING:
+            if (paramEnum == Il2CppTypeEnum::TYPE_STRING) local = 3;
+            else if (paramEnum == Il2CppTypeEnum::TYPE_OBJECT
+                  || paramEnum == Il2CppTypeEnum::TYPE_CLASS) local = 1;
+            break;
+
+        case LUA_TLIGHTUSERDATA:
+            if (paramEnum == Il2CppTypeEnum::TYPE_I
+                || paramEnum == Il2CppTypeEnum::TYPE_U
+                || paramEnum == Il2CppTypeEnum::TYPE_OBJECT
+                || paramEnum == Il2CppTypeEnum::TYPE_CLASS)
+                local = 2;
+            break;
+
+        case LUA_TTABLE:
+        case LUA_TFUNCTION:
+            if (paramEnum == Il2CppTypeEnum::TYPE_OBJECT) local = 1;
+            break;
+
+        case LUA_TUSERDATA:
+        {
+            LuaInstanceUD* instUD = LuaBridge_CheckInstance(L, firstArgIdx + i);
+            if (instUD == nullptr || instUD->obj == nullptr)
+            {
+                // Method / Field / Class 等其他 userdata 按 object 处理
+                if (paramEnum == Il2CppTypeEnum::TYPE_OBJECT) local = 1;
+            }
+            else if (paramEnum == Il2CppTypeEnum::TYPE_STRING)
+            {
+                // 字符串参数需要 Il2CppString* 普通对象不能直接传
+                local = -100;
+            }
+            else if (paramEnum == Il2CppTypeEnum::TYPE_OBJECT)
+            {
+                local = 1;
+            }
+            else if (paramEnum == Il2CppTypeEnum::TYPE_CLASS
+                  || paramEnum == Il2CppTypeEnum::TYPE_SZARRAY
+                  || paramEnum == Il2CppTypeEnum::TYPE_ARRAY)
+            {
+                Il2CppClass* instClass = instUD->klass;
+                if (instClass == nullptr) instClass = READ_OFFSET(instUD->obj, 0, Il2CppClass*)[0];
+                Il2CppClass* paramClass = resolver.GetClassFromType(paramType);
+                if (instClass != nullptr && paramClass != nullptr)
+                {
+                    if (instClass == paramClass) local = 3;
+                    else
+                    {
+                        // 沿父类链查找 子类实例可匹配父类参数
+                        local = 2;
+                        Il2CppClass* parent = resolver.GetClassParent(instClass);
+                        while (parent != nullptr)
+                        {
+                            if (parent == paramClass) break;
+                            parent = resolver.GetClassParent(parent);
+                        }
+                        if (parent == nullptr) local = -100;
+                    }
+                }
+                else local = 1;
+            }
+            else if (paramEnum == Il2CppTypeEnum::TYPE_VALUETYPE
+                  || paramEnum == Il2CppTypeEnum::TYPE_ENUM
+                  || paramEnum == Il2CppTypeEnum::TYPE_GENERICINST)
+            {
+                // 值类型 / 枚举 / 泛型实例参数: 仅类完全一致时匹配
+                Il2CppClass* instClass = instUD->klass;
+                if (instClass == nullptr) instClass = READ_OFFSET(instUD->obj, 0, Il2CppClass*)[0];
+                Il2CppClass* paramClass = resolver.GetClassFromType(paramType);
+                if (instClass != nullptr && paramClass != nullptr && instClass == paramClass) local = 3;
+            }
+            break;
+        }
+
+        default:
+            break;
+        }
+
+        score += local;
+        // 某个参数完全不兼容 直接放弃该候选
+        if (local < 0) return INT32_MIN;
+    }
+
+    return score;
+}
+
+// 选择最佳重载方法（找不到返回 nullptr）
+static const Il2CppMethod* ResolveMethodOverload(lua_State* L, Il2CppClass* klass, const char* name, int firstArgIdx)
+{
+    auto& resolver = Il2CppResolver::Instance();
+
+    const int32_t MAX_METHODS = 1024;
+    const Il2CppMethod* methods[MAX_METHODS];
+    int32_t methodCount = resolver.EnumerateMethods(klass, methods, MAX_METHODS);
+
+    // Lua 实参个数
+    int luaArgCount = lua_gettop(L) - firstArgIdx + 1;
+
+    // 第一遍: 同名且参数个数匹配的候选
+    std::vector<const Il2CppMethod*> candidates;
+    for (int32_t i = 0; i < methodCount; ++i)
+    {
+        const Il2CppMethod* m = methods[i];
+        const char* mname = resolver.GetMethodName(m);
+        if (mname == nullptr || strcmp(mname, name) != 0) continue;
+        if (resolver.GetMethodParamCount(m) != luaArgCount) continue;
+        candidates.push_back(m);
+    }
+
+    // 恰好一个 → 直接使用
+    if (candidates.size() == 1) return candidates[0];
+
+    // 多个 → 按类型兼容性打分 取最高分（并列取第一个）
+    if (candidates.size() > 1)
+    {
+        const Il2CppMethod* best = nullptr;
+        int bestScore = INT32_MIN;
+        for (const Il2CppMethod* m : candidates)
+        {
+            int score = ScoreMethodAgainstArgs(L, m, firstArgIdx);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best = m;
+            }
+        }
+        if (best != nullptr) return best;
+    }
+
+    // 没有参数个数匹配的重载 → 回退第一个同名方法（保持旧行为）
+    for (int32_t i = 0; i < methodCount; ++i)
+    {
+        const Il2CppMethod* m = methods[i];
+        const char* mname = resolver.GetMethodName(m);
+        if (mname != nullptr && strcmp(mname, name) == 0) return m;
+    }
+
+    return nullptr;
+}
+
 // cls:static_call(name, ...) → value
-// 按名称调用静态方法
+// 按名称调用静态方法（同名重载自动按参数个数与类型匹配）
 static int Class_StaticCall(lua_State* L)
 {
     LuaClassUD* ud = static_cast<LuaClassUD*>(luaL_checkudata(L, 1, LuaBridgeMT::CLASS));
     const char* name = luaL_checkstring(L, 2);
-    auto& resolver = Il2CppResolver::Instance();
 
-    const Il2CppMethod* method = resolver.GetMethod(ud->klass, name);
+    const Il2CppMethod* method = ResolveMethodOverload(L, ud->klass, name, 3);
     if (method == nullptr) return luaL_error(L, "method not found: %s", name);
 
     // 静态方法 obj 传 nullptr
@@ -1584,19 +2267,18 @@ static const luaL_Reg class_methods[] = {
 // ============================================================
 
 // obj:call(name, ...) → value
-// 按名称调用实例方法
+// 按名称调用实例方法（同名重载自动按参数个数与类型匹配）
 static int Instance_Call(lua_State* L)
 {
     LuaInstanceUD* ud = static_cast<LuaInstanceUD*>(luaL_checkudata(L, 1, LuaBridgeMT::INSTANCE));
     const char* name = luaL_checkstring(L, 2);
-    auto& resolver = Il2CppResolver::Instance();
 
     // 确保 klass 已知
     Il2CppClass* klass = ud->klass;
     if (klass == nullptr && ud->obj != nullptr) klass = READ_OFFSET(ud->obj, 0, Il2CppClass*)[0];
     if (klass == nullptr) return luaL_error(L, "cannot determine class for instance");
 
-    const Il2CppMethod* method = resolver.GetMethod(klass, name);
+    const Il2CppMethod* method = ResolveMethodOverload(L, klass, name, 3);
     if (method == nullptr) return luaL_error(L, "method not found: %s", name);
 
     return InvokeMethod(L, method, ud->obj, 3);
@@ -1822,7 +2504,7 @@ static int Instance_NewIndex(lua_State* L)
 }
 
 // obj:__len() → number
-// 返回数组长度（如果是数组的话）
+// 返回数组 / List<T> 长度（非容器返回 0）
 static int Instance_Len(lua_State* L)
 {
     LuaInstanceUD* ud = static_cast<LuaInstanceUD*>(luaL_checkudata(L, 1, LuaBridgeMT::INSTANCE));
@@ -1832,52 +2514,45 @@ static int Instance_Len(lua_State* L)
         return 1;
     }
 
-    if (LuaBridge_IsArray(ud->obj)) lua_pushinteger(L, static_cast<int64_t>(LuaBridge_GetArrayLength(ud->obj)));
-    // 非数组返回 0
+    if (LuaBridge_IsArray(ud->obj))
+    {
+        lua_pushinteger(L, static_cast<int64_t>(LuaBridge_GetArrayLength(ud->obj)));
+    }
+    else if (LuaBridge_IsList(ud->obj, ud->klass))
+    {
+        int64_t count = LuaBridge_GetListCount(ud->obj, ud->klass);
+        lua_pushinteger(L, count >= 0 ? count : 0);
+    }
+    // 非容器返回 0
     else lua_pushinteger(L, 0);
     return 1;
 }
 
 // obj:each(function(value, index) ... end)
-// 数组遍历: 从 1 到数组长度逐个取出元素调用回调
+// 数组 / List<T> 遍历: 从 1 到长度逐个取出元素调用回调
 // 回调参数与 arr[i] 语义一致 索引从 1 开始（C# 下标 = index - 1）
 static int Instance_Each(lua_State* L)
 {
     LuaInstanceUD* ud = static_cast<LuaInstanceUD*>(luaL_checkudata(L, 1, LuaBridgeMT::INSTANCE));
     if (ud->obj == nullptr) return luaL_error(L, "instance is null");
 
-    // 仅数组支持遍历
-    if (!LuaBridge_IsArray(ud->obj)) return luaL_error(L, "object is not an array");
-
     // 回调必须是函数
     luaL_checktype(L, 2, LUA_TFUNCTION);
 
-    // 获取数组长度
-    uint64_t len = LuaBridge_GetArrayLength(ud->obj);
-
-    // 逐个元素调用回调
-    for (uint64_t i = 0; i < len; ++i)
+    if (LuaBridge_IsArray(ud->obj))
     {
-        // 读取数组元素压栈（与 obj[i] 使用同一套编组）
-        if (!LuaBridge_PushArrayElement(L, ud->obj, static_cast<int64_t>(i)))
-        {
-            return luaL_error(L, "unsupported array element type at index %llu", static_cast<unsigned long long>(i));
-        }
-
-        // 压入回调函数与 Lua 索引（从 1 开始）
-        lua_pushvalue(L, 2);
-        lua_pushinteger(L, static_cast<lua_Integer>(i + 1));
-
-        // 调用 callback(value, index)
-        int status = lua_pcall(L, 2, 0, 0);
-        if (status != LUA_OK)
-        {
-            const char* err = lua_tostring(L, -1);
-            lua_pop(L, 1);
-            return luaL_error(L, "array each callback error: %s", err ? err : "(non-string error)");
-        }
+        int64_t count = 0;
+        LuaBridge_EachArray(L, ud->obj, 2, count);
+        return 0;
     }
-    return 0;
+    if (LuaBridge_IsList(ud->obj, ud->klass))
+    {
+        int64_t count = 0;
+        LuaBridge_EachList(L, ud->obj, ud->klass, 2, count);
+        return 0;
+    }
+
+    return luaL_error(L, "object is not an array or List");
 }
 
 // Instance 元表方法注册表
@@ -2492,7 +3167,19 @@ bool LuaBridge_Init(lua_State* L)
     // ---- 注册 il2cpp 全局表 ----
     lua_newtable(L);                   // 创建 il2cpp 表
     luaL_setfuncs(L, il2cpp_funcs, 0); // 注册函数
+
+    // ---- 注册 il2cpp.mainThread 子表 ----
+    // 主线程调度（参考 frida-il2cpp-bridge 的 Il2Cpp.mainThread.schedule）
+    lua_newtable(L);                    // 创建 mainThread 表
+    luaL_setfuncs(L, main_thread_funcs, 0); // 注册函数
+    lua_setfield(L, -2, "mainThread");  // il2cpp.mainThread = 表
+
     lua_setglobal(L, "il2cpp");        // 设置为全局变量
+
+    // ---- 预装内部主线程 tick hook ----
+    // 让 il2cpp.mainThread.is_ready() 初始即为 true
+    // 预装失败不阻塞初始化 首次 schedule 时会自动重试
+    Il2CppHook::EnsureMainThreadTickInstalled();
 
     return true;
 }

@@ -36,7 +36,7 @@ namespace protocol
     enum MessageType : uint8_t
     {
         // DLL → EXE
-        MSG_HELLO = 0x10,   // 握手：负载为版本字符串 "Il2CppLua/2.0.0"
+        MSG_HELLO = 0x10,   // 握手：负载为版本字符串 "Il2CppLua/2.1.0"
         MSG_READY = 0x11,   // 初始化就绪：负载为状态描述文本
         MSG_LOG   = 0x20,   // Lua print 输出：负载为输出文本
         MSG_ERROR = 0x21,   // 错误信息：负载为错误描述
@@ -89,7 +89,7 @@ namespace protocol
     constexpr DWORD WAITSERVER_BUSY = 5000;
 
     // 版本标识（HELLO 帧的负载内容）
-    constexpr const char* VERSION = "Il2CppLua/2.0.0";
+    constexpr const char* VERSION = "Il2CppLua/2.1.0";
 
     // 共享内存名称前缀：注入器创建共享内存写入管道名 
     // DLL 加载后读取 完整名称 = 前缀 + 目标进程 PID

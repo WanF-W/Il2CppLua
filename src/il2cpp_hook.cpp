@@ -11,6 +11,8 @@
  * ·回调出错或异常时回跳 MinHook 生成的原始 trampoline
  * ·回调内可通过 original() 调用原方法（参考 frida-il2cpp-bridge）
  *   （临时禁用 Hook 后经 il2cpp_runtime_invoke 合法执行 与 mth:call 同路径）
+ * ·内部主线程 tick hook 复用同一套跳板 只排空主线程调度队列
+ *   不调用 Lua 回调 始终保持回跳原方法（参考 frida 的 mainThread.schedule）
  *
  * x64 参数布局（MS x64 ABI + IL2CPP 生成代码）
  * 
@@ -25,6 +27,7 @@
  * ·Lua 状态机使用可重入互斥锁（回调内可再次触发 Hook）
  * ·锁顺序固定为 Lua -> HookRegistry 避免死锁
  * ·回调期间额外 pin 一份 Lua 函数引用 防止回调内卸载导致悬空
+ * ·主线程调度队列用独立互斥锁保护 任意线程可安全入队
  * ============================================================
  */
 
@@ -36,9 +39,11 @@
 #include "../minhook_src/MinHook.h"
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -122,6 +127,7 @@ struct HookEntry
     uint32_t hookId = 0;                  // thunk 中写入的编号
 
     bool enabled = false;                 // 当前是否处于启用状态
+    bool isInternalTick = false;          // 内部主线程 tick（不调用 Lua 回调）
 
     Il2CppClass* klass = nullptr;         // 声明类
     bool isStatic = false;                // 是否静态方法
@@ -176,6 +182,21 @@ static std::atomic<bool> g_shutdown{false};
 static std::atomic<int32_t> g_activeCallbacks{0};
 static bool g_minhookInitialized = false;
 
+// ============================================================
+// 主线程调度状态（参考 frida-il2cpp-bridge 的 mainThread.schedule）
+// ============================================================
+// schedule 可能从任意线程入队（CLI 工作线程 / Hook 回调线程）
+// 由内部 tick hook 在 Unity 主线程上取出来执行
+static std::mutex g_scheduleMutex;             // 保护调度队列
+static std::deque<int> g_scheduleQueue;        // 待执行的 Lua 函数引用
+static std::atomic<DWORD> g_mainThreadId{0};   // 捕获的 Unity 主线程 ID
+static bool g_tickInstalled = false;           // 内部 tick hook 是否已安装
+static uint32_t g_tickHookId = UINT32_MAX;     // tick 条目在 g_entries 中的编号
+static bool g_tickFailed = false;              // 安装失败是否已提示过
+static std::string g_tickNs;                   // 当前 tick 入口（命名空间）
+static std::string g_tickClass;                // 当前 tick 入口（类名）
+static std::string g_tickMethod;               // 当前 tick 入口（方法名）
+
 // thunk 大小（mov eax,imm32 + jmp [rip+0] + 8 字节地址，16 字节对齐）
 constexpr uint32_t HOOK_THUNK_SIZE = 16;
 
@@ -229,6 +250,196 @@ static void* AllocateThunk(uint32_t hookId, void* detour)
 
     FlushInstructionCache(GetCurrentProcess(), mem, HOOK_THUNK_SIZE);
     return mem;
+}
+
+// ============================================================
+// 内部主线程 tick hook
+// ============================================================
+// 借用 HookDetour 跳板挂一个"每帧必调 + 只在主线程调用"的 Unity 方法
+// 分发器发现内部 tick 条目时不调用 Lua 回调 只排空主线程调度队列
+// 始终保持 ctx->original 非空 由汇编跳板回跳原函数 不影响游戏行为
+//
+// 入口候选按顺序尝试 第一个 methodPointer 非空者胜出
+// 若游戏完全不调用默认候选 可用 il2cpp.mainThread.set_tick 指定入口
+struct TickCandidate
+{
+    const char* ns;      // 命名空间
+    const char* klass;   // 类名
+    const char* method;  // 方法名
+};
+
+// ============================================================
+// Unity 主线程识别
+// ============================================================
+// 进程的初始线程（创建时间最早）就是 WinMain 所在线程 即 Unity 主线程
+// 通过 Toolhelp32 快照枚举线程 比较创建时间得到主线程 ID
+// 失败返回 0（调用方回退为首次触发 tick 的线程）
+static DWORD ResolveMainThreadId()
+{
+    DWORD mainId = 0;
+    ULARGE_INTEGER earliest{};
+    bool haveEarliest = false;
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+
+    THREADENTRY32 te;
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te))
+    {
+        do
+        {
+            // 只统计当前进程的线程
+            if (te.th32OwnerProcessID != GetCurrentProcessId()) continue;
+
+            HANDLE hThread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+            if (hThread == nullptr) continue;
+
+            FILETIME createTime, exitTime, kernelTime, userTime;
+            if (GetThreadTimes(hThread, &createTime, &exitTime, &kernelTime, &userTime))
+            {
+                ULARGE_INTEGER t;
+                t.LowPart = createTime.dwLowDateTime;
+                t.HighPart = createTime.dwHighDateTime;
+                // 创建时间最早者即进程初始线程（Unity 主线程）
+                if (!haveEarliest || t.QuadPart < earliest.QuadPart)
+                {
+                    haveEarliest = true;
+                    earliest.QuadPart = t.QuadPart;
+                    mainId = te.th32ThreadID;
+                }
+            }
+            CloseHandle(hThread);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return mainId;
+}
+
+// 尝试安装指定入口的内部 tick hook
+// 调用方必须持有 g_mutex
+static bool TryInstallTickHook(const char* namespaze, const char* klassName, const char* methodName)
+{
+    auto& resolver = Il2CppResolver::Instance();
+    if (!resolver.IsInitialized()) return false;
+
+    // 查找类/方法并读取原生函数指针
+    Il2CppClass* klass = resolver.GetClass(namespaze, klassName);
+    if (klass == nullptr) return false;
+    const Il2CppMethod* method = resolver.GetMethod(klass, methodName);
+    if (method == nullptr) return false;
+    void* target = resolver.GetMethodPointer(method);
+    if (target == nullptr) return false;
+    if (!EnsureMinHookInitialized()) return false;
+
+    // 构建条目 复用与用户 Hook 相同的 thunk + HookDetour 机制
+    // 该机制保存全部参数寄存器 回跳时原样恢复 可适配任意方法签名
+    auto entry = std::make_unique<HookEntry>();
+    entry->hookId = static_cast<uint32_t>(g_entries.size());
+    entry->target = target;
+    entry->method = method;
+    entry->klass = klass;
+    entry->isInternalTick = true;   // 分发器走 tick 分支
+    entry->luaRef = LUA_REFNIL;
+
+    entry->thunk = AllocateThunk(entry->hookId, reinterpret_cast<void*>(&HookDetour));
+    if (entry->thunk == nullptr) return false;
+
+    MH_STATUS status = MH_CreateHook(target, entry->thunk, &entry->original);
+    if (status != MH_OK)
+    {
+        VirtualFree(entry->thunk, 0, MEM_RELEASE);
+        return false;
+    }
+
+    status = MH_EnableHook(target);
+    if (status != MH_OK)
+    {
+        MH_RemoveHook(target);
+        VirtualFree(entry->thunk, 0, MEM_RELEASE);
+        return false;
+    }
+
+    entry->enabled = true;
+    g_entries.push_back(std::move(entry));
+    g_tickHookId = static_cast<uint32_t>(g_entries.size() - 1);
+    g_tickInstalled = true;
+    g_tickNs = namespaze;
+    g_tickClass = klassName;
+    g_tickMethod = methodName;
+
+    // 解析 Unity 主线程 ID（进程初始线程 创建时间最早）
+    // 解析失败时保持 0 由分发器回退为首个触发 tick 的线程
+    if (g_mainThreadId.load(std::memory_order_relaxed) == 0)
+    {
+        g_mainThreadId.store(ResolveMainThreadId(), std::memory_order_relaxed);
+    }
+    return true;
+}
+
+// 按默认候选顺序安装内部 tick hook
+// 调用方必须持有 g_mutex
+static bool InstallDefaultTickHook()
+{
+    if (g_tickInstalled) return true;
+
+    static const TickCandidate kTickCandidates[] = {
+        {"UnityEngine", "Time", "get_deltaTime"},   // 逻辑帧必调 最常用
+        {"UnityEngine", "Time", "get_frameCount"},  // 部分游戏走帧计数
+        {"UnityEngine", "Object", "get_name"},      // 兜底：热路径但调用频率不定
+    };
+
+    for (const TickCandidate& cand : kTickCandidates)
+    {
+        if (TryInstallTickHook(cand.ns, cand.klass, cand.method)) return true;
+    }
+    return false;
+}
+
+// ============================================================
+// 主线程调度队列排空
+// ============================================================
+// 调用方必须持有 Lua 互斥锁（可重入）
+// 队列函数逐个执行 错误记录日志后继续下一个
+static void DrainMainThreadQueue(lua_State* L)
+{
+    // 一次性取出全部待执行引用
+    // 执行期间新 schedule 的引用留在队列里 等下一次 tick 再执行
+    std::vector<int> refs;
+    {
+        std::lock_guard<std::mutex> lock(g_scheduleMutex);
+        if (g_scheduleQueue.empty()) return;
+        refs.assign(g_scheduleQueue.begin(), g_scheduleQueue.end());
+        g_scheduleQueue.clear();
+    }
+
+    for (int ref : refs)
+    {
+        // 读取函数并 pin 一份引用 防止执行期间被 Lua 侧释放
+        lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+        if (!lua_isfunction(L, -1))
+        {
+            lua_pop(L, 1);
+            luaL_unref(L, LUA_REGISTRYINDEX, ref);
+            continue;
+        }
+        int pinRef = luaL_ref(L, LUA_REGISTRYINDEX);
+
+        // 执行: function() 返回值忽略（同步 Lua 无法像 frida 一样回传 Promise）
+        lua_rawgeti(L, LUA_REGISTRYINDEX, pinRef);
+        int status = lua_pcall(L, 0, 0, 0);
+        if (status != LUA_OK)
+        {
+            const char* err = lua_tostring(L, -1);
+            char buf[512];
+            snprintf(buf, sizeof(buf), "[mainThread] scheduled callback error: %s", err ? err : "(non-string error)");
+            PipeChannel::Instance().SendLog(buf);
+            lua_pop(L, 1);
+        }
+
+        luaL_unref(L, LUA_REGISTRYINDEX, pinRef);
+        luaL_unref(L, LUA_REGISTRYINDEX, ref);
+    }
 }
 
 // ============================================================
@@ -1007,6 +1218,7 @@ static void DispatchSafe(NativeHookContext* ctx)
     HookEntry* e = nullptr;
     int pinRef = LUA_REFNIL;
     bool ok = false;
+    bool isTick = false;
 
     auto& engine = LuaEngine::Instance();
     lua_State* L = engine.GetState();
@@ -1033,8 +1245,26 @@ static void DispatchSafe(NativeHookContext* ctx)
         // 预设原始 trampoline 回调失败/异常时回跳
         ctx->original = e->original;
 
-        // 关闭中/未启用/无回调 -> 直接回跳原始函数
-        if (g_shutdown.load() || !e->enabled || e->luaRef == LUA_REFNIL) goto cleanup;
+        // 关闭中/未启用 -> 直接回跳原始函数
+        if (g_shutdown.load() || !e->enabled) goto cleanup;
+
+        // 内部主线程 tick：只排空主线程调度队列 不调用 Lua 回调
+        // 始终保持 ctx->original 非空 由汇编跳板回跳原函数
+        if (e->isInternalTick)
+        {
+            // 主线程 ID 未解析成功时 回退为首个触发 tick 的线程
+            // （正常情况安装时已通过进程初始线程识别 无需捕获）
+            if (g_mainThreadId.load(std::memory_order_relaxed) == 0)
+            {
+                g_mainThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+            }
+            isTick = true;
+            g_activeCallbacks.fetch_add(1);
+            ctx->hasResult = 1;
+            goto unlocked;
+        }
+
+        if (e->luaRef == LUA_REFNIL) goto cleanup;
 
         // 在锁内 pin 一份回调引用
         // 防止回调执行期间被 Lua 层 unhook 释放导致悬空
@@ -1051,9 +1281,24 @@ static void DispatchSafe(NativeHookContext* ctx)
         ctx->hasResult = 1;
     }
 
-    // 执行 Lua 回调（期间持有 Lua 互斥锁）
-    ok = InvokePinnedCallback(L, e, pinRef, ctx);
-    if (ok) ctx->original = nullptr;
+unlocked:
+    if (isTick)
+    {
+        // 部分入口方法可能被后台线程偶尔调用 按 ID 过滤只排空主线程队列
+        // 排空期间持有 Lua 互斥锁（可重入 回调内可继续 schedule）
+        if (g_mainThreadId.load(std::memory_order_relaxed) != 0
+            && GetCurrentThreadId() == g_mainThreadId.load(std::memory_order_relaxed))
+        {
+            DrainMainThreadQueue(L);
+        }
+        // 保持 ctx->original 非空 由汇编跳板回跳原始函数
+    }
+    else
+    {
+        // 执行 Lua 回调（期间持有 Lua 互斥锁）
+        ok = InvokePinnedCallback(L, e, pinRef, ctx);
+        if (ok) ctx->original = nullptr;
+    }
 
     // 释放 pin 引用
     if (pinRef != LUA_REFNIL) luaL_unref(L, LUA_REGISTRYINDEX, pinRef);
@@ -1348,6 +1593,8 @@ void Il2CppHook::UnhookAll()
     std::lock_guard<std::mutex> lock(g_mutex);
     for (auto& entry : g_entries)
     {
+        // 内部主线程 tick hook 属于基础设施 不随用户 unhook_all 卸载
+        if (entry->isInternalTick) continue;
         if (entry->target != nullptr) MH_DisableHook(entry->target);
         entry->enabled = false;
         if (entry->luaRef != LUA_REFNIL && L != nullptr)
@@ -1356,6 +1603,97 @@ void Il2CppHook::UnhookAll()
         }
         entry->luaRef = LUA_REFNIL;
     }
+}
+
+// ============================================================
+// 公共 API：主线程调度
+// ============================================================
+bool Il2CppHook::MainThreadSchedule(lua_State* L, int callbackIdx)
+{
+    if (L == nullptr || !lua_isfunction(L, callbackIdx)) return false;
+
+    // 保存引用（调用方持有 Lua 互斥锁 可安全操作 registry）
+    lua_pushvalue(L, callbackIdx);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    // 入队（任意线程可安全调用）
+    {
+        std::lock_guard<std::mutex> lock(g_scheduleMutex);
+        g_scheduleQueue.push_back(ref);
+    }
+
+    // 首次使用时惰性安装内部 tick hook
+    bool needLog = false;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!InstallDefaultTickHook() && !g_tickFailed)
+        {
+            g_tickFailed = true;
+            needLog = true;
+        }
+    }
+    if (needLog)
+    {
+        PipeChannel::Instance().SendLog(
+            "[mainThread] tick hook not installed, scheduled callbacks will not run "
+            "(use il2cpp.mainThread.set_tick to specify an entry method)\n");
+    }
+
+    return true;
+}
+
+bool Il2CppHook::SetMainThreadTickTarget(const char* namespaze, const char* klass, const char* method)
+{
+    if (namespaze == nullptr || klass == nullptr || method == nullptr) return false;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    // 禁用旧 tick hook（保留 trampoline 与条目 避免在途回调悬空）
+    if (g_tickHookId != UINT32_MAX && g_tickHookId < g_entries.size())
+    {
+        HookEntry* old = g_entries[g_tickHookId].get();
+        if (old != nullptr)
+        {
+            old->enabled = false;
+            if (old->target != nullptr) MH_DisableHook(old->target);
+        }
+    }
+    g_tickHookId = UINT32_MAX;
+    g_tickInstalled = false;
+    g_tickFailed = false;
+    g_mainThreadId.store(0);
+    g_tickNs.clear();
+    g_tickClass.clear();
+    g_tickMethod.clear();
+
+    if (!TryInstallTickHook(namespaze, klass, method))
+    {
+        g_tickFailed = true;
+        return false;
+    }
+    return true;
+}
+
+bool Il2CppHook::GetMainThreadTickTarget(std::string& namespaze, std::string& klass, std::string& method)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_tickInstalled || g_tickNs.empty()) return false;
+    namespaze = g_tickNs;
+    klass = g_tickClass;
+    method = g_tickMethod;
+    return true;
+}
+
+bool Il2CppHook::IsMainThreadTickInstalled()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_tickInstalled;
+}
+
+bool Il2CppHook::EnsureMainThreadTickInstalled()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return InstallDefaultTickHook();
 }
 
 // ============================================================
@@ -1398,6 +1736,29 @@ void Il2CppHook::Shutdown()
     }
     g_entries.clear();
     g_index.clear();
+
+    // 释放尚未执行的主线程调度引用
+    {
+        std::lock_guard<std::mutex> lock(g_scheduleMutex);
+        for (int ref : g_scheduleQueue)
+        {
+            if (ref != LUA_REFNIL && L != nullptr)
+            {
+                luaL_unref(L, LUA_REGISTRYINDEX, ref);
+            }
+        }
+        g_scheduleQueue.clear();
+    }
+
+    // 重置主线程调度状态（支持重新初始化后再次安装）
+    g_tickInstalled = false;
+    g_tickHookId = UINT32_MAX;
+    g_tickFailed = false;
+    g_mainThreadId.store(0);
+    g_tickNs.clear();
+    g_tickClass.clear();
+    g_tickMethod.clear();
+
     lock.unlock();
 
     if (g_minhookInitialized)

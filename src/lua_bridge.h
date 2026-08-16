@@ -14,6 +14,10 @@
  * ·obj:call("SetPosition", 1, 2, 3)
  * ·local x = obj:get("position_x")
  * ·obj:set("position_x", 10)
+ * ·il2cpp.mainThread.schedule(function() ... end) -- 排队到主线程执行
+ * ·il2cpp.each(container, fn)  -- 遍历 Lua 表 / 数组 / List<T>
+ * ·il2cpp.dump(container)      -- 输出容器长度与全部元素
+ * ·obj:call(name, ...)         -- 按名称调用 同名重载自动匹配
  *
  * 四种 userdata 类型
  * 
