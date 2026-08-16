@@ -1,253 +1,334 @@
-# Il2CppLua
+<div align="center">
 
-> A native C++ bridge for Lua interaction with Il2Cpp — v2.1.0
+# 🔧 Il2CppLua
 
+在 Unity IL2CPP 游戏里用 Lua 读写数据、调用方法、Hook 逻辑
+
+**v2.1.0** · Windows x64 · Unity 2018.3+ · MIT
+
+</div>
+
+## 📑 目录
+
+- [简介](#intro)
+- [特性](#features)
+- [快速开始](#quickstart)
+- [API 参考](#api)
+  - [全局函数 `il2cpp.*`](#api-global)
+  - [Class 元表](#api-class)
+  - [Instance 元表](#api-instance)
+  - [Method 元表](#api-method)
+  - [Field 元表](#api-field)
+  - [主线程调度 `il2cpp.mainThread`](#api-mainthread)
+- [Hook 使用](#hook)
+- [线程模型](#threading)
+- [构建](#build)
+- [已知限制](#limits)
+- [License](#license)
+
+<a id="intro"></a>
 ## 简介
 
 Il2CppLua 是一个注入到 Unity IL2CPP 游戏进程内的原生 DLL。它动态解析
-GameAssembly.dll 的 `il2cpp_*` 导出函数，把 IL2CPP 的类 / 对象 / 方法 / 字段
-暴露给内嵌的 Lua 5.4 虚拟机，让你可以用 Lua 脚本直接读写游戏数据、调用方法，
-并通过 MinHook 对游戏方法做原生级 Hook。配套的 CLI 工具是 ILune（负责注入与
-管道交互控制台），两个项目必须配合使用。
+GameAssembly.dll 的 `il2cpp_*` 导出函数，把 IL2CPP 的类、对象、方法、字段
+暴露给内嵌的 Lua 5.4 虚拟机，并通过 MinHook 提供方法级 Hook。
 
-## 特性
+配套 CLI 工具是 [ILune](../ILune)，负责 DLL 注入与交互式控制台，两个项目
+必须配合使用。
 
-- 动态解析 GameAssembly.dll 导出函数，不依赖任何外部 SDK 或 dump 头文件
-- 内嵌 Lua 5.4.8，完整标准库，`print` 输出重定向到 CLI 控制台
-- Class / Instance / Method / Field 四种 userdata，接口风格参考 frida-il2cpp-bridge
-- 实例字段 / 静态字段读写，实例方法 / 静态方法调用
-- 按名称调用时自动匹配重载（参数个数 + Lua 实参类型兼容性打分）
-- 方法级 Hook（MinHook）：回调内可调用 `original()` 执行原方法、替换参数或返回值
-- 主线程调度 `il2cpp.mainThread.schedule`：把 Lua 代码投递到 Unity 主线程执行
-- 通用遍历 `il2cpp.each` / `il2cpp.dump`：支持 Lua 表、IL2CPP 数组、`List<T>`
-- 数组元素读写（`obj[i]`、`#obj`），`List<T>` 长度与遍历
-- 通过 Windows 命名管道与 CLI 通信：命令执行、实时输出、错误回传、版本握手
-- 仅 Windows x64 + Unity 2018.3+ IL2CPP
+<a id="features"></a>
+## ✨ 特性
 
-## 工作原理
+- 动态解析 GameAssembly.dll 导出函数，不依赖外部 SDK 或 dump 头文件
+- 内嵌 Lua 5.4.8，完整标准库，`print` 输出实时回显
+- Class / Instance / Method / Field 四种 userdata，风格参考 frida-il2cpp-bridge
+- 实例 / 静态字段读写，实例 / 静态方法调用
+- `call` / `static_call` 按名称自动匹配重载
+- MinHook 方法级 Hook，回调内可调用 `original()` 执行原方法
+- `il2cpp.mainThread.schedule` 把 Lua 代码投递到 Unity 主线程执行
+- `il2cpp.each` / `il2cpp.dump` 通用遍历：Lua 表、数组、`List<T>`
+- 数组下标读写与 `#` 长度，`List<T>` 同样支持
+- 命名管道 IPC，带版本握手与超时保护
 
-1. ILune 通过 `CreateRemoteThread + LoadLibraryW`（失败时回退 `NtCreateThreadEx`）
-   把本 DLL 注入目标游戏进程，并通过共享内存传递管道名称。
-2. DLL 的工作线程连接命名管道、发送 HELLO 握手。
-3. 工作线程重试等待 GameAssembly.dll 加载，随后解析全部 `il2cpp_*` 导出函数、
-   附加当前线程、缓存所有程序集 Image。
-4. 创建 Lua 虚拟机并注册桥接层（`LuaBridge_Init`），发送 READY 通知 CLI。
-5. 进入消息循环：收到 CMD / FILE 帧就执行 Lua 代码，把 `print` 输出、返回值
-   回显、错误信息通过 LOG / ERROR / OK 帧回传。
+<a id="quickstart"></a>
+## 🚀 快速开始
 
-所有 Lua 访问由一把可重入互斥锁串行化；Hook 回调可能发生在任意游戏线程，
-分发器会先 `il2cpp_thread_attach` 再进入 Lua，保证调用 IL2CPP API 合法。
-
-## 目录结构
-
-```
-src/
-  dll_main.cpp         DLL 入口、工作线程、消息循环
-  il2cpp_resolver.*    GameAssembly.dll 导出函数解析与封装
-  lua_bridge.*         Lua ↔ IL2CPP 桥接（userdata 元表、类型编组）
-  lua_engine.*         Lua 虚拟机管理、print 重定向、返回值回显
-  il2cpp_hook.*        MinHook 方法 Hook 与主线程调度
-  hook_stub.asm        Hook 共用汇编跳板（x64 MASM）
-  pipe_channel.*       DLL 侧命名管道客户端
-  protocol.h           两端共享的通信协议定义
-lua_src/               内嵌 Lua 5.4.8 源码
-minhook_src/           MinHook 源码（x86/x64）
-```
-
-## 构建
-
-环境要求：
-
-- Windows x64
-- Visual Studio 2022（平台工具集 v145）
-- Windows SDK 10.0
-- MASM（ml64，用于编译 `hook_stub.asm`，VS 自带）
-
-步骤：
-
-1. 打开 `Il2CppLua.slnx`（或直接打开 `Il2CppLua.vcxproj`）。
-2. 配置选择 **Release | x64**。
-3. 生成解决方案，产物为 `Il2CppLua.dll`。
-
-> 注意：Debug / Win32 配置是调试用宿主程序，正式使用请使用 Release|x64
-> （该配置输出 DLL）。
-
-## 快速开始
-
-1. 编译出 `Il2CppLua.dll` 与 `ILune` 项目的 `ilune.exe`，放在同一目录。
-2. 启动目标游戏。
-3. 运行 `ilune -n Game.exe`（按进程名）或 `ilune -p 1234`（按 PID）。
-4. 在 `ilune >>` 提示符后直接输入 Lua 代码。
+1. 编译 `Il2CppLua.dll` 与 `ilune.exe`，放在同一目录
+2. 启动游戏，运行 `ilune -n Game.exe`
+3. 在 `ilune >>` 提示符后输入 Lua
 
 ```lua
--- 查找类
 local hero = il2cpp.get_class("MyGame", "HeroData")
-print(hero:get_name(), hero:get_namespace())
+local obj  = hero:new()
 
--- 创建对象并调用方法（同名重载自动匹配）
-local obj = hero:new()
 obj:call("SetLevel", 10)
 print(obj:call("GetLevel"))
 
--- 读写字段
-print(obj:get("hp"))
 obj:set("hp", 100)
-
--- 静态字段 / 静态方法
-local count = hero:static_get("InstanceCount")
-hero:static_call("Reset")
-
--- 查找某个类型的存活对象
-local objs = il2cpp.find_objects(hero)
-for i, o in ipairs(objs) do print(i, o) end
+print(obj:get("hp"))
 ```
 
-## Lua API 参考
+<a id="api"></a>
+## 📖 API 参考
 
-### 全局函数（`il2cpp.*`）
+<a id="api-global"></a>
+### 全局函数 `il2cpp.*`
 
-| 函数 | 说明 |
+| API | 说明 |
 | --- | --- |
-| `get_status()` | 返回导出函数解析状态文本 |
-| `get_class(namespace, name)` | 按命名空间 + 类名查找类，返回 Class 或 nil |
-| `get_assemblies()` | 返回程序集（Image）数量 |
-| `get_image_count()` | 返回镜像数量（同 get_assemblies） |
-| `is_initialized()` | 桥接层是否已初始化 |
-| `wrap(address)` | 把裸指针包装为 Instance（读对象头识别类） |
-| `find_objects(klass)` | 通过 `FindObjectsOfType` 查找该类型的存活对象，返回 table |
+| `get_class(ns, name)` | 查找类，返回 `Class` 或 `nil` |
+| `get_status()` | 导出函数解析状态 |
+| `is_initialized()` | 是否初始化完成 |
+| `get_assemblies()` / `get_image_count()` | 程序集 / 镜像数量 |
+| `wrap(address)` | 裸指针包装为 `Instance` |
+| `find_objects(klass)` | 查找该类型的存活对象 |
 | `each(container, fn)` | 通用遍历，回调 `fn(value, index)` |
-| `dump(container)` | 输出容器长度与全部元素（`[index] = value`） |
+| `dump(container)` | 输出容器长度与全部元素 |
 | `unhook_all()` | 卸载全部用户 Hook |
 
-`il2cpp.each` / `il2cpp.dump` 支持三种容器：Lua 表（先数组部分再键值部分）、
-IL2CPP 数组、`System.Collections.Generic.List<T>`。
+```lua
+-- get_class：最常用的入口
+local hero = il2cpp.get_class("MyGame", "HeroData")
 
-### Class 元表（`cls:...`）
+-- 状态查询
+print(il2cpp.get_status())
+print(il2cpp.is_initialized())
+print(il2cpp.get_assemblies(), il2cpp.get_image_count())
 
-| 方法 | 说明 |
+-- wrap：把裸指针包成 Instance
+local obj = il2cpp.wrap(0x7FF600001234)
+
+-- find_objects + each + dump
+local objs = il2cpp.find_objects(hero)
+il2cpp.each(objs, function(o, i) print(i, o) end)
+il2cpp.dump(objs)
+
+-- 清理
+il2cpp.unhook_all()
+```
+
+`each` / `dump` 支持三种容器：Lua 表、IL2CPP 数组、`List<T>`。
+
+<a id="api-class"></a>
+### Class 元表
+
+| API | 说明 |
 | --- | --- |
-| `get_name()` | 类名 |
-| `get_namespace()` | 命名空间 |
-| `get_parent()` | 父类，Class 或 nil |
-| `get_method(name)` | 按名字找方法，返回 Method 或 nil（返回第一个同名方法） |
-| `get_methods()` | 全部方法，返回 table of Method |
-| `get_field(name)` | 按名字找字段，返回 Field 或 nil |
-| `get_fields()` | 全部字段，返回 table of Field |
-| `new(...)` | 分配对象并按参数个数匹配 `.ctor` 调用 |
-| `static_call(name, ...)` | 调用静态方法（同名重载自动匹配） |
-| `static_get(name)` | 读静态字段 |
-| `static_set(name, value)` | 写静态字段 |
+| `get_name()` / `get_namespace()` / `get_parent()` | 类名、命名空间、父类 |
+| `get_method(name)` / `get_methods()` | 查找单个 / 全部方法 |
+| `get_field(name)` / `get_fields()` | 查找单个 / 全部字段 |
+| `new(...)` | 创建对象并按参数个数匹配构造函数 |
+| `static_call(name, ...)` | 调用静态方法（自动匹配重载） |
+| `static_get(name)` / `static_set(name, v)` | 读写静态字段 |
 | `find_objects()` | 查找该类型的存活对象 |
-| `get_instance_size()` | 对象实例大小（含对象头） |
-| `get_address()` | 返回 `Il2CppClass*` 原始地址 |
+| `get_instance_size()` / `get_address()` | 实例大小 / 类地址 |
 
-### Instance 元表（`obj:...`）
+```lua
+local cls = il2cpp.get_class("MyGame", "HeroData")
 
-| 方法 / 操作符 | 说明 |
+-- 类信息
+print(cls:get_name(), cls:get_namespace())
+print(cls:get_parent())
+
+-- 方法 / 字段
+local mth  = cls:get_method("GetLevel")
+local fld  = cls:get_field("hp")
+local mths = cls:get_methods()
+local flds = cls:get_fields()
+
+-- 创建对象
+local obj = cls:new()
+
+-- 静态成员
+cls:static_call("Reset")
+cls:static_set("InstanceCount", 1)
+print(cls:static_get("InstanceCount"))
+
+-- 对象查找 / 信息
+il2cpp.dump(cls:find_objects())
+print(cls:get_instance_size())
+print(string.format("0x%X", cls:get_address()))
+```
+
+<a id="api-instance"></a>
+### Instance 元表
+
+| API | 说明 |
 | --- | --- |
-| `call(name, ...)` | 按名字调用实例方法（同名重载自动匹配） |
-| `get(name)` | 读实例字段 |
-| `set(name, value)` | 写实例字段 |
-| `get_class()` | 对象的类 |
-| `get_address()` | 对象指针地址 |
-| `each(fn)` | 遍历数组 / `List<T>`，回调 `fn(value, index)` |
-| `obj[i]` | 读取数组元素（Lua 索引从 1 开始） |
-| `obj[i] = v` | 写入数组元素 |
+| `call(name, ...)` | 调用实例方法（自动匹配重载） |
+| `get(name)` / `set(name, v)` | 读写实例字段 |
+| `get_class()` / `get_address()` | 类 / 对象地址 |
+| `each(fn)` | 遍历数组或 `List<T>` |
+| `obj[i]` / `obj[i] = v` | 数组元素读写（Lua 索引从 1 开始） |
 | `#obj` | 数组 / `List<T>` 长度 |
 
-### Method 元表（`mth:...`）
+```lua
+local obj = hero:new()
 
-| 方法 | 说明 |
+-- call / get / set
+local lv = obj:call("GetLevel")
+obj:call("SetLevel", lv + 1)
+obj:set("hp", 100)
+print(obj:get("hp"))
+
+-- 信息
+print(obj:get_class():get_name())
+print(string.format("0x%X", obj:get_address()))
+
+-- T[] 数组
+local arr = obj:get("buffers")
+print(#arr, arr[1])
+arr[1] = 999
+
+-- List<T>：长度、遍历、按下标取元素
+local lst = obj:get("itemList")
+print(#lst)
+lst:each(function(item, i) print(i, item) end)
+print(lst:call("get_Item", 0))
+```
+
+<a id="api-method"></a>
+### Method 元表
+
+| API | 说明 |
 | --- | --- |
-| `get_name()` | 方法名 |
-| `get_param_count()` | 参数个数 |
-| `get_return_type()` | 返回值类型名 |
-| `get_params()` | 参数类型名列表，table of string |
-| `is_static()` | 是否静态方法 |
-| `call(obj, ...)` | 显式调用（实例方法第一个参数传 Instance，静态方法传 nil） |
-| `ovload(type1, ...)` | 按参数类型签名查找重载，返回 Method |
-| `hook(function(this, original, ...) ... end)` | 替换方法实现 |
-| `unhook()` | 恢复原始实现 |
-| `hooked()` | 是否已 Hook |
-| `get_address()` | 方法原生代码地址（methodPointer） |
+| `get_name()` / `get_param_count()` | 方法名 / 参数个数 |
+| `get_return_type()` / `get_params()` | 返回类型 / 参数类型列表 |
+| `is_static()` | 是否静态 |
+| `call(obj, ...)` | 显式调用（静态传 `nil`） |
+| `ovload(type1, ...)` | 按类型签名找重载 |
+| `hook(fn)` / `unhook()` / `hooked()` | Hook / 恢复 / 查询 |
+| `get_address()` | 方法原生地址（methodPointer） |
 
-`ovload` 的类型字符串：`bool / byte / sbyte / short / ushort / int / uint /
+```lua
+local mth = cls:get_method("GetLevel")
+
+-- 方法信息
+print(mth:get_name(), mth:get_param_count())
+print(mth:get_return_type())
+il2cpp.dump(mth:get_params())
+print(mth:is_static())
+print(string.format("0x%X", mth:get_address()))
+
+-- 显式调用：实例方法传 Instance
+print(mth:call(obj))
+
+-- 按类型签名找重载再调用
+local setter = cls:get_method("SetLevel"):ovload("int")
+setter:call(obj, 99)
+
+-- Hook（详见下文）
+mth:hook(function(this, original) return original() + 1 end)
+print(mth:hooked())
+mth:unhook()
+```
+
+`ovload` 类型字符串：`bool / byte / sbyte / short / ushort / int / uint /
 long / ulong / float / double / char / string / object / void`，或类名
 （支持 `"Namespace.ClassName"` 格式）。
 
-### Field 元表（`fld:...`）
+<a id="api-field"></a>
+### Field 元表
 
-| 方法 | 说明 |
+| API | 说明 |
 | --- | --- |
-| `get_name()` | 字段名 |
-| `get_type()` | 字段类型名 |
+| `get_name()` / `get_type()` | 字段名 / 类型 |
 | `get_offset()` | 字段在对象内的字节偏移 |
-| `get(obj)` | 读字段（obj 传 Instance；静态字段传 nil） |
-| `set(obj, value)` | 写字段（obj 传 Instance；静态字段传 nil） |
+| `get(obj)` / `set(obj, v)` | 读写字段（静态传 `nil`） |
 
-### 主线程调度（`il2cpp.mainThread`）
+```lua
+local fld = cls:get_field("hp")
+print(fld:get_name(), fld:get_type(), fld:get_offset())
 
-参考 frida-il2cpp-bridge 的 `Il2Cpp.mainThread.schedule`，把一段 Lua 代码投递到
-Unity 主线程执行，从而安全调用只有主线程能做的操作。
+-- 实例字段
+print(fld:get(obj))
+fld:set(obj, 500)
 
-| 方法 | 说明 |
+-- 静态字段
+local countFld = cls:get_field("InstanceCount")
+countFld:set(nil, 2)
+print(countFld:get(nil))
+```
+
+<a id="api-mainthread"></a>
+### 主线程调度 `il2cpp.mainThread`
+
+| API | 说明 |
 | --- | --- |
-| `schedule(fn)` | 把函数加入队列，主线程在下一个 tick 取出执行（无参数、无返回值） |
-| `set_tick(namespace, class, method)` | 指定内部 tick 入口方法，返回 boolean |
-| `get_tick()` | 返回当前 tick 入口的 namespace, class, method |
-| `is_ready()` | 内部 tick hook 是否已安装 |
-
-内部 tick hook 默认依次尝试 `Time.get_deltaTime` / `Time.get_frameCount` /
-`Object.get_name`，初始化时自动预装；`schedule` 会惰性重试。若目标游戏不调用
-这些默认入口，用 `set_tick` 指定一个每帧必调且只在主线程调用的方法。
+| `schedule(fn)` | 投递到 Unity 主线程执行 |
+| `set_tick(ns, class, method)` | 指定内部 tick 入口 |
+| `get_tick()` | 查询当前 tick 入口 |
+| `is_ready()` | 内部 tick 是否已安装 |
 
 ```lua
 il2cpp.mainThread.schedule(function()
-    print("run on unity main thread")
+    print("在 Unity 主线程执行")
 end)
+
+-- 默认入口不可用时手动指定
+print(il2cpp.mainThread.set_tick("UnityEngine", "Time", "get_deltaTime"))
+print(il2cpp.mainThread.get_tick())
+print(il2cpp.mainThread.is_ready())
 ```
 
-### Hook 示例
+内部 tick 默认依次尝试 `Time.get_deltaTime` / `Time.get_frameCount` /
+`Object.get_name`，初始化时自动预装。
+
+<a id="hook"></a>
+### Hook 使用
 
 ```lua
-local mth = hero:get_method("Damage")
+local mth = cls:get_method("Damage")
+
 mth:hook(function(this, original, amount)
-    print("Damage called, amount =", amount)
-    -- 不调用 original: 返回值直接作为方法返回值（可替换返回值）
-    -- 调用 original: 使用原始参数执行
-    --   return original()           -- 原始参数
-    --   return original(amount * 2) -- 替换参数
-    return original(amount)
+    print("Damage:", amount)
+    -- 不调用 original：直接替换返回值
+    -- return 0
+    -- 调用 original：透传原始参数或替换参数
+    return original(amount * 2)
 end)
 
--- 卸载
 mth:unhook()
 ```
 
 回调签名与 frida-il2cpp-bridge 一致：
 
-- 实例方法：`function(this, original, 参数1, ...)`，`this` 为 Instance
-- 静态方法：`function(Class, original, 参数1, ...)`，第一个参数为声明类
-- `original()` 无参调用时透传原始参数；`original(替换参数...)` 使用替换参数
-- 回调返回值会作为方法返回值（void 方法忽略）
+- 实例方法：`function(this, original, ...)`
+- 静态方法：`function(Class, original, ...)`
+- `original()` 透传原始参数，`original(替换参数...)` 替换参数
+- 回调返回值作为方法返回值（void 方法忽略）
 
-## 线程模型
+<a id="threading"></a>
+## 🧵 线程模型
 
-- Lua 状态机由一把可重入互斥锁保护，同一时刻只有一个线程执行 Lua 代码；
-  Hook 回调内再次调用被 Hook 的方法不会死锁。
-- Hook 回调可能发生在任意游戏线程，分发器自动附加 IL2CPP 线程后再进 Lua。
-- `schedule` 的任务由 Unity 主线程执行，期间持有同一把 Lua 锁。
-- 卸载 Hook 时只禁用不释放 trampoline，避免在途回调悬空。
+- Lua 状态机由可重入互斥锁串行化，Hook 回调内可再次调用被 Hook 的方法
+- Hook 回调可能发生在任意游戏线程，分发器先附加 IL2CPP 线程再进 Lua
+- `schedule` 任务由 Unity 主线程执行
+- 卸载 Hook 只禁用不释放 trampoline，避免在途回调悬空
 
-## 已知限制
+<a id="build"></a>
+## 🔨 构建
 
-- 仅 Windows x64；假定 Unity 2018.3+（静态方法不再携带无用的 `__this` 参数）。
-- `ref/out` 参数目前只读，回调内修改不会写回。
-- 共享同一 methodPointer 的泛型实例化方法只能 Hook 其中一个 MethodInfo。
-- `cls:get_method(name)` 返回第一个同名方法，精确重载请用
-  `get_methods()` + `mth:ovload(...)` 或直接依赖 `call` 的自动匹配。
-- 方法枚举上限 1024 个（`get_methods` / 重载匹配共用）。
+环境要求：Windows x64、Visual Studio 2022（工具集 v145）、Windows SDK 10.0、
+MASM（编译 `hook_stub.asm`，VS 自带）。
 
-## License
+```bat
+:: 打开 Il2CppLua.slnx，选择 Release | x64 生成
+:: 产物：Il2CppLua.dll
+```
 
-MIT License. 详见 [LICENSE](LICENSE)。
+> Debug / Win32 配置是调试宿主程序，正式使用请用 Release | x64。
+
+<a id="limits"></a>
+## ⚠️ 已知限制
+
+- 仅 Windows x64，假定 Unity 2018.3+
+- `ref/out` 参数只读，回调内修改不会写回
+- 共享 methodPointer 的泛型实例化方法只能 Hook 其中一个
+- `get_method(name)` 返回第一个同名方法，精确重载用 `ovload`
+- 方法枚举上限 1024 个
+
+<a id="license"></a>
+## 📄 License
+
+MIT License，详见 [LICENSE](LICENSE)。
