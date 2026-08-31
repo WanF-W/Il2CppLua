@@ -1,6 +1,6 @@
 <div align="center">
 
-# Il2CppLua
+# 🧩 Il2CppLua
 
 在 Unity IL2CPP 游戏进程中使用 Lua 检查类型、操作对象、调用方法与 Hook 逻辑
 
@@ -8,7 +8,7 @@
 
 </div>
 
-## 目录
+## 📑 目录
 
 - [项目定位](#project-positioning)
 - [主要能力](#capabilities)
@@ -32,7 +32,7 @@
 
 <a id="project-positioning"></a>
 
-## 项目定位
+## 🎯 项目定位
 
 Il2CppLua 是注入 Unity IL2CPP 游戏进程的原生运行时桥接 DLL。它从
 `GameAssembly.dll` 动态解析 IL2CPP API，将程序集、类、对象、方法和字段映射为
@@ -46,7 +46,7 @@ Il2CppLua 适合正常使用 IL2CPP 运行时、并保留必要 `il2cpp_*` 导�
 
 <a id="capabilities"></a>
 
-## 主要能力
+## ✨ 主要能力
 
 - 在全部程序集或指定程序集内查找类型
 - 枚举程序集、类、方法和字段
@@ -61,7 +61,7 @@ Il2CppLua 适合正常使用 IL2CPP 运行时、并保留必要 `il2cpp_*` 导�
 
 <a id="quick-start"></a>
 
-## 快速开始
+## 🚀 快速开始
 
 将相同版本的 `Il2CppLua.dll` 与 `ilune.exe` 放在同一目录，启动游戏后执行：
 
@@ -94,7 +94,7 @@ end
 
 <a id="api-model"></a>
 
-## API 模型
+## 🧭 API 模型
 
 | 层级 | 用途 |
 | --- | --- |
@@ -111,11 +111,11 @@ Lua table 使用 `lua.each` / `lua.dump`。IL2CPP 数组和 `List<T>` 使用
 
 <a id="api-reference"></a>
 
-## API 参考
+## 📚 API 参考
 
 <a id="api-lua"></a>
 
-### `lua`：Lua table 工具
+### 🧰 `lua`：Lua table 工具
 
 | API | 作用 |
 | --- | --- |
@@ -173,7 +173,7 @@ print(lua.hex(address))
 
 <a id="api-il2cpp"></a>
 
-### `il2cpp`：运行时入口
+### ⚙️ `il2cpp`：运行时入口
 
 | API | 作用 |
 | --- | --- |
@@ -342,7 +342,7 @@ end
 
 <a id="api-assembly"></a>
 
-### `Assembly`：程序集
+### 📦 `Assembly`：程序集
 
 | API | 作用 |
 | --- | --- |
@@ -393,7 +393,7 @@ print(assembly)
 
 <a id="api-class"></a>
 
-### `Class`：类型
+### 🧬 `Class`：类型
 
 | API | 作用 |
 | --- | --- |
@@ -582,7 +582,7 @@ cls:dump()
 
 <a id="api-instance"></a>
 
-### `Instance`：托管对象与容器
+### 🎮 `Instance`：托管对象与容器
 
 | API / 语法 | 作用 |
 | --- | --- |
@@ -702,7 +702,7 @@ end)
 
 <a id="api-method"></a>
 
-### `Method`：精确方法
+### 🔧 `Method`：精确方法
 
 | API | 作用 |
 | --- | --- |
@@ -791,7 +791,7 @@ end
 
 <a id="api-field"></a>
 
-### `Field`：精确字段
+### 🏷️ `Field`：精确字段
 
 | API | 作用 |
 | --- | --- |
@@ -839,7 +839,7 @@ Field 接口适合需要避免同名字段歧义的场景。`const` 字段不可
 
 <a id="type-mapping"></a>
 
-## Lua 与 IL2CPP 类型映射
+## 🔄 Lua 与 IL2CPP 类型映射
 
 | IL2CPP 类型 | Lua 表示 |
 | --- | --- |
@@ -855,7 +855,7 @@ Lua integer 是有符号 64 位；读取大于 `INT64_MAX` 的 `ulong` 时会按
 
 <a id="hook-threading"></a>
 
-## Hook 与线程模型
+## 🪝 Hook 与线程模型
 
 - Lua VM 由可重入互斥锁串行访问。
 - Hook 回调可能来自任意游戏线程。
@@ -869,7 +869,7 @@ Unity 对象，应通过 `il2cpp.schedule` 操作。
 
 <a id="protocol-version"></a>
 
-## 通信与版本校验
+## 📡 通信与版本校验
 
 ILune 创建命名管道并注入 DLL，DLL 连接后发送：
 
@@ -885,7 +885,7 @@ received，并在等待 READY 或进入 REPL 前终止连接。
 
 <a id="ilune-cli"></a>
 
-## ILune 命令行
+## 💻 ILune 命令行
 
 ```text
 ilune.exe -n <进程名> [-d <DLL路径>] [-l <Lua脚本>]
@@ -904,7 +904,7 @@ REPL 中输入表达式会自动作为 `return <表达式>` 执行，语句则�
 
 <a id="build"></a>
 
-## 构建
+## 🔨 构建
 
 要求：Windows x64、Visual Studio 2022、Windows SDK 10.0、MSVC v145 工具集，以及
 MASM x64 构建支持。
@@ -914,7 +914,7 @@ MASM x64 构建支持。
 
 <a id="limitations"></a>
 
-## 已知限制
+## ⚠️ 已知限制
 
 - 仅支持 Windows x64。
 - 依赖目标运行时保留所需的 `il2cpp_*` 导出函数。
@@ -928,6 +928,6 @@ MASM x64 构建支持。
 
 <a id="license"></a>
 
-## License
+## 📄 License
 
 MIT License，详见 [LICENSE](LICENSE)。
