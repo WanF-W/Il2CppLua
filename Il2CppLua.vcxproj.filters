@@ -4,11 +4,20 @@
     <Filter Include="lua_src">
       <UniqueIdentifier>{4d233d3f-0ee8-4680-a3f5-d8408242beb7}</UniqueIdentifier>
     </Filter>
-    <Filter Include="src">
-      <UniqueIdentifier>{20f53811-9f84-4b91-be4b-c905b4f97935}</UniqueIdentifier>
-    </Filter>
     <Filter Include="minhook_src">
       <UniqueIdentifier>{3d8d42f1-2b4e-4c5e-9f1a-7d0b2a5c6e71}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="cpp_src">
+      <UniqueIdentifier>{2c053716-981d-4ada-b1bb-2e7ed97613e8}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="h_src">
+      <UniqueIdentifier>{20f53811-9f84-4b91-be4b-c905b4f97935}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="rc_src">
+      <UniqueIdentifier>{85edf603-a849-4bbe-8836-fa47275aa7e4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="asm_src">
+      <UniqueIdentifier>{7eec5889-8ce3-414e-aeb9-857911866579}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -108,24 +117,6 @@
     <ClCompile Include="lua_src\lzio.c">
       <Filter>lua_src</Filter>
     </ClCompile>
-    <ClCompile Include="src\pipe_channel.cpp">
-      <Filter>src</Filter>
-    </ClCompile>
-    <ClCompile Include="src\lua_engine.cpp">
-      <Filter>src</Filter>
-    </ClCompile>
-    <ClCompile Include="src\il2cpp_resolver.cpp">
-      <Filter>src</Filter>
-    </ClCompile>
-    <ClCompile Include="src\il2cpp_hook.cpp">
-      <Filter>src</Filter>
-    </ClCompile>
-    <ClCompile Include="src\lua_bridge.cpp">
-      <Filter>src</Filter>
-    </ClCompile>
-    <ClCompile Include="src\dll_main.cpp">
-      <Filter>src</Filter>
-    </ClCompile>
     <ClCompile Include="minhook_src\buffer.c">
       <Filter>minhook_src</Filter>
     </ClCompile>
@@ -141,11 +132,54 @@
     <ClCompile Include="minhook_src\trampoline.c">
       <Filter>minhook_src</Filter>
     </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <Masm Include="src\hook_stub.asm">
-      <Filter>src</Filter>
-    </Masm>
+    <ClCompile Include="src\dll_main.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\il2cpp_hook.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\il2cpp_resolver.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\il2cpp_scheduler.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\lua_binding_assembly.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\lua_binding_class.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\lua_binding_field.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\lua_binding_instance.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\lua_binding_method.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\lua_binding_root.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\lua_bridge_init.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\lua_container.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\lua_engine.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\lua_userdata.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\pipe_channel.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\lua_value.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="lua_src\lapi.h">
@@ -233,25 +267,37 @@
       <Filter>lua_src</Filter>
     </ClInclude>
     <ClInclude Include="src\pipe_channel.h">
-      <Filter>src</Filter>
+      <Filter>h_src</Filter>
     </ClInclude>
     <ClInclude Include="src\protocol.h">
-      <Filter>src</Filter>
+      <Filter>h_src</Filter>
+    </ClInclude>
+    <ClInclude Include="src\version.h">
+      <Filter>h_src</Filter>
     </ClInclude>
     <ClInclude Include="src\common.h">
-      <Filter>src</Filter>
+      <Filter>h_src</Filter>
     </ClInclude>
     <ClInclude Include="src\lua_engine.h">
-      <Filter>src</Filter>
+      <Filter>h_src</Filter>
     </ClInclude>
     <ClInclude Include="src\lua_bridge.h">
-      <Filter>src</Filter>
+      <Filter>h_src</Filter>
     </ClInclude>
     <ClInclude Include="src\il2cpp_resolver.h">
-      <Filter>src</Filter>
+      <Filter>h_src</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hook_stub.h">
+      <Filter>h_src</Filter>
     </ClInclude>
     <ClInclude Include="src\il2cpp_hook.h">
-      <Filter>src</Filter>
+      <Filter>h_src</Filter>
+    </ClInclude>
+    <ClInclude Include="src\il2cpp_scheduler.h">
+      <Filter>h_src</Filter>
+    </ClInclude>
+    <ClInclude Include="src\lua_binding_internal.h">
+      <Filter>h_src</Filter>
     </ClInclude>
     <ClInclude Include="minhook_src\MinHook.h">
       <Filter>minhook_src</Filter>
@@ -261,5 +307,15 @@
     <None Include="lua_src\Makefile">
       <Filter>lua_src</Filter>
     </None>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\version.rc">
+      <Filter>rc_src</Filter>
+    </ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Masm Include="src\hook_stub.asm">
+      <Filter>asm_src</Filter>
+    </Masm>
   </ItemGroup>
 </Project>

@@ -1,7 +1,6 @@
 <Solution>
   <Configurations>
     <Platform Name="x64" />
-    <Platform Name="x86" />
   </Configurations>
   <Project Path="Il2CppLua.vcxproj" Id="f21b3908-46bb-4752-a8b7-170230c0816a" />
 </Solution>

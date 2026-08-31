@@ -3,8 +3,8 @@
 ; ============================================================
 ; 所有被 Hook 的方法入口都会先跳到各自的 thunk:
 ;   mov eax, <hookId>
-;   jmp qword ptr [rip+0]  -> HookDetour
-; 因此进入 HookDetour 时:
+;   jmp qword ptr [rip+0]  -> HookDetourEntry
+; 因此进入 HookDetourEntry 时:
 ;   RAX          = hookId
 ;   RCX/RDX/R8/R9 = 前 4 个整数参数
 ;   XMM0-XMM3    = 前 4 个浮点参数
@@ -44,11 +44,13 @@ HookFrame_Size     EQU 144
 .CODE
 
 EXTERN HookDispatch:PROC
+; C++ 将该入口视为不透明代码地址，显式公开名称供链接器解析。
+PUBLIC HookDetourEntry
 
 ; ============================================================
-; HookDetour - 所有 Hook 的公共入口
+; HookDetourEntry - 所有 Hook 的公共入口
 ; ============================================================
-HookDetour PROC FRAME
+HookDetourEntry PROC FRAME
     push rbp
     .pushreg rbp
     mov rbp, rsp
@@ -115,6 +117,6 @@ jump_original:
     pop rbp
     jmp rax
 
-HookDetour ENDP
+HookDetourEntry ENDP
 
 END

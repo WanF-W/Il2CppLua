@@ -127,7 +127,7 @@ bool LuaEngine::Init(OutputCallback outputCb)
     lua_pop(m_L, 1);
 
     // 注册 IL2CPP 桥接函数
-    // LuaBridge_Init 创建 4 张元表并注册 il2cpp 全局表
+    // LuaBridge_Init 创建五张 userdata 元表并注册 il2cpp 与 lua 全局表
     // 这一步必须在 Lua VM 创建之后、执行用户代码之前完成
     if (!LuaBridge_Init(m_L))
     {
@@ -430,6 +430,16 @@ int LuaEngine::LuaPrint(lua_State* L)
 // ============================================================
 // 打印返回值（自动回显）
 // ============================================================
+// 在 lua_pcall 内执行 luaL_tolstring，使 userdata 的 __tostring 错误保持为普通
+// Lua 错误。直接在 ExecuteBuffer 的 pcall 结束后调用 luaL_tolstring，会让错误
+// 越过保护边界并终止承载 IPC 的工作线程。
+static int ProtectedToString(lua_State* L)
+{
+    luaL_checkany(L, 1);
+    luaL_tolstring(L, 1, nullptr);
+    return 1;
+}
+
 // 执行完 Lua 代码后 如果栈上有返回值 逐个打印 
 // 每个返回值占一行 格式：值 (类型名)
 void LuaEngine::PrintReturnValues(lua_State* L, int count, const OutputCallback& outputCb)
@@ -457,29 +467,29 @@ void LuaEngine::PrintReturnValues(lua_State* L, int count, const OutputCallback&
         }
         else
         {
-            // luaL_tolstring 对所有类型都能生成字符串描述
-            // 
-            // ·字符串/数字：直接返回值
-            // ·userdata：调用 __tostring 元方法
-            // ·table/无 __tostring 的类型：返回 "type: address" 格式
-            // 
-            // 结果会推入栈顶 使用后需弹出
-            size_t len = 0;
-            const char* s = luaL_tolstring(L, idx, &len);
-            if (s != nullptr)
+            // tostring 可能调用用户数据的 __tostring 元方法，必须放在独立 pcall 中。
+            lua_pushcfunction(L, ProtectedToString);
+            lua_pushvalue(L, idx);
+            const int stringifyStatus = lua_pcall(L, 1, 1, 0);
+            if (stringifyStatus == LUA_OK)
             {
-                output.append(s, len);
-                output += '\n';
+                size_t len = 0;
+                const char* text = lua_tolstring(L, -1, &len);
+                if (text != nullptr) output.append(text, len);
+                else output += "(" + std::string(lua_typename(L, type)) + ")";
             }
             else
             {
-                const char* typeName = lua_typename(L, type);
-                output += '(';
-                output += (typeName ? typeName : "unknown");
-                output += ")\n";
+                size_t errorLength = 0;
+                const char* error = lua_tolstring(L, -1, &errorLength);
+                output += "<tostring error: ";
+                if (error != nullptr) output.append(error, errorLength);
+                else output += "unknown error";
+                output += '>';
             }
+            output += '\n';
 
-            // 弹出 luaL_tolstring 推入的结果
+            // 弹出 tostring 结果或 pcall 错误，原始返回值仍留在基线区域。
             lua_pop(L, 1);
         }
     }

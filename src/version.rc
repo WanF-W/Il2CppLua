@@ -1,0 +1,34 @@
+#include <windows.h>
+#include "version.h"
+
+// Windows 文件属性只负责标识发布产物；运行时兼容性由 HELLO 握手严格校验。
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION IL2CPPLUA_VERSION_NUMERIC
+ PRODUCTVERSION IL2CPPLUA_VERSION_NUMERIC
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "FileDescription", "Il2CppLua Runtime Bridge"
+            VALUE "FileVersion", IL2CPPLUA_VERSION_STRING
+            VALUE "InternalName", "Il2CppLua"
+            VALUE "OriginalFilename", "Il2CppLua.dll"
+            VALUE "ProductName", "Il2CppLua"
+            VALUE "ProductVersion", IL2CPPLUA_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

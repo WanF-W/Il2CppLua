@@ -98,6 +98,7 @@ void Il2CppResolver::Shutdown()
         // 清空缓存
         std::lock_guard<std::mutex> lock(m_mutex);
         m_imageCache.clear();
+        m_assemblyCache.clear();
         m_classCache.clear();
     }
 
@@ -105,9 +106,16 @@ void Il2CppResolver::Shutdown()
     m_domain_get = nullptr;
     m_domain_get_assemblies = nullptr;
     m_assembly_get_image = nullptr;
+    m_image_get_assembly = nullptr;
+    m_image_get_name = nullptr;
+    m_image_get_class_count = nullptr;
+    m_image_get_class = nullptr;
     m_thread_attach = nullptr;
     m_thread_detach = nullptr;
     m_class_from_name = nullptr;
+    m_class_get_image = nullptr;
+    m_class_is_valuetype = nullptr;
+    m_class_is_enum = nullptr;
     m_class_get_name = nullptr;
     m_class_get_namespace = nullptr;
     m_class_get_parent = nullptr;
@@ -119,15 +127,19 @@ void Il2CppResolver::Shutdown()
     m_class_get_method_from_name = nullptr;
     m_class_get_methods = nullptr;
     m_method_get_name = nullptr;
+    m_method_get_param_name = nullptr;
     m_method_get_param_count = nullptr;
     m_method_get_return_type = nullptr;
     m_method_get_param = nullptr;
     m_method_get_flags = nullptr;
+    m_class_is_assignable_from = nullptr;
     m_class_get_field_from_name = nullptr;
     m_class_get_fields = nullptr;
     m_field_get_name = nullptr;
+    m_field_get_parent = nullptr;
     m_field_get_type = nullptr;
     m_field_get_offset = nullptr;
+    m_field_get_flags = nullptr;
     m_field_get_value = nullptr;
     m_field_set_value = nullptr;
     m_field_static_get_value = nullptr;
@@ -181,6 +193,10 @@ bool Il2CppResolver::ResolveExports()
     RESOLVE(domain_get, pfn_domain_get);
     RESOLVE(domain_get_assemblies, pfn_domain_get_assemblies);
     RESOLVE(assembly_get_image, pfn_assembly_get_image);
+    RESOLVE(image_get_assembly, pfn_image_get_assembly);
+    RESOLVE(image_get_name, pfn_image_get_name);
+    RESOLVE(image_get_class_count, pfn_image_get_class_count);
+    RESOLVE(image_get_class, pfn_image_get_class);
 
     // 线程管理
     RESOLVE(thread_attach, pfn_thread_attach);
@@ -188,6 +204,9 @@ bool Il2CppResolver::ResolveExports()
 
     // 类操作
     RESOLVE(class_from_name, pfn_class_from_name);
+    RESOLVE(class_get_image, pfn_class_get_image);
+    RESOLVE(class_is_valuetype, pfn_class_is_valuetype);
+    RESOLVE(class_is_enum, pfn_class_is_enum);
     RESOLVE(class_get_name, pfn_class_get_name);
     RESOLVE(class_get_namespace, pfn_class_get_namespace);
     RESOLVE(class_get_parent, pfn_class_get_parent);
@@ -201,17 +220,21 @@ bool Il2CppResolver::ResolveExports()
     RESOLVE(class_get_method_from_name, pfn_class_get_method_from_name);
     RESOLVE(class_get_methods, pfn_class_get_methods);
     RESOLVE(method_get_name, pfn_method_get_name);
+    RESOLVE(method_get_param_name, pfn_method_get_param_name);
     RESOLVE(method_get_param_count, pfn_method_get_param_count);
     RESOLVE(method_get_return_type, pfn_method_get_return_type);
     RESOLVE(method_get_param, pfn_method_get_param);
     RESOLVE(method_get_flags, pfn_method_get_flags);
+    RESOLVE(class_is_assignable_from, pfn_class_is_assignable_from);
 
     // 字段操作
     RESOLVE(class_get_field_from_name, pfn_class_get_field_from_name);
     RESOLVE(class_get_fields, pfn_class_get_fields);
     RESOLVE(field_get_name, pfn_field_get_name);
+    RESOLVE(field_get_parent, pfn_field_get_parent);
     RESOLVE(field_get_type, pfn_field_get_type);
     RESOLVE(field_get_offset, pfn_field_get_offset);
+    RESOLVE(field_get_flags, pfn_field_get_flags);
     RESOLVE(field_get_value, pfn_field_get_value);
     RESOLVE(field_set_value, pfn_field_set_value);
     RESOLVE(field_static_get_value, pfn_field_static_get_value);
@@ -306,11 +329,98 @@ void Il2CppResolver::CacheAllImages()
 
         // 获取程序集对应的 Image
         Il2CppImage* image = m_assembly_get_image(assemblies[i]);
-        if (image != nullptr) m_imageCache.push_back(image);
+        if (image != nullptr)
+        {
+            m_assemblyCache.push_back(assemblies[i]);
+            m_imageCache.push_back(image);
+        }
     }
 
     // 注意：assemblies 指针指向的内存由 IL2CPP 运行时管理 
     // 我们不需要释放它 但这个指针只在当前线程 attach 状态下有效 
+}
+
+// ============================================================
+// 程序集与镜像查询
+// ============================================================
+Il2CppAssembly* Il2CppResolver::GetAssemblyAt(int32_t index) const
+{
+    if (index < 0 || static_cast<size_t>(index) >= m_assemblyCache.size()) return nullptr;
+    return m_assemblyCache[static_cast<size_t>(index)];
+}
+
+static std::string NormalizeAssemblyName(const std::string& value)
+{
+    std::string result = value;
+    std::transform(result.begin(), result.end(), result.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    if (result.size() > 4 && result.compare(result.size() - 4, 4, ".dll") == 0)
+        result.resize(result.size() - 4);
+    return result;
+}
+
+Il2CppAssembly* Il2CppResolver::GetAssembly(const std::string& name) const
+{
+    const std::string wanted = NormalizeAssemblyName(name);
+    for (Il2CppAssembly* assembly : m_assemblyCache)
+    {
+        const char* current = GetAssemblyName(assembly);
+        if (current != nullptr && NormalizeAssemblyName(current) == wanted) return assembly;
+    }
+    return nullptr;
+}
+
+const char* Il2CppResolver::GetAssemblyName(Il2CppAssembly* assembly) const
+{
+    if (assembly == nullptr || m_assembly_get_image == nullptr || m_image_get_name == nullptr) return nullptr;
+    Il2CppImage* image = m_assembly_get_image(assembly);
+    return image != nullptr ? m_image_get_name(image) : nullptr;
+}
+
+Il2CppAssembly* Il2CppResolver::GetClassAssembly(Il2CppClass* klass) const
+{
+    if (klass == nullptr || m_class_get_image == nullptr) return nullptr;
+    const Il2CppImage* image = m_class_get_image(klass);
+    if (image == nullptr) return nullptr;
+
+    // 优先利用初始化时建立的 Assembly/Image 对应缓存，
+    // 旧版 Unity 缺少 image_get_assembly 导出时仍可正常反查。
+    for (size_t i = 0; i < m_imageCache.size() && i < m_assemblyCache.size(); ++i)
+    {
+        if (m_imageCache[i] == image) return m_assemblyCache[i];
+    }
+
+    return m_image_get_assembly != nullptr
+        ? const_cast<Il2CppAssembly*>(m_image_get_assembly(image))
+        : nullptr;
+}
+
+Il2CppClass* Il2CppResolver::GetClass(Il2CppAssembly* assembly, const std::string& namespaze,
+    const std::string& className) const
+{
+    if (assembly == nullptr || m_assembly_get_image == nullptr || m_class_from_name == nullptr) return nullptr;
+    Il2CppImage* image = m_assembly_get_image(assembly);
+    return image != nullptr ? m_class_from_name(image, namespaze.c_str(), className.c_str()) : nullptr;
+}
+
+int32_t Il2CppResolver::GetAssemblyClassCount(Il2CppAssembly* assembly) const
+{
+    if (assembly == nullptr || m_assembly_get_image == nullptr || m_image_get_class_count == nullptr) return -1;
+    Il2CppImage* image = m_assembly_get_image(assembly);
+    if (image == nullptr) return -1;
+    const size_t count = m_image_get_class_count(image);
+    return count > static_cast<size_t>(INT32_MAX) ? INT32_MAX : static_cast<int32_t>(count);
+}
+
+Il2CppClass* Il2CppResolver::GetAssemblyClassAt(Il2CppAssembly* assembly, int32_t index) const
+{
+    if (assembly == nullptr || index < 0 || m_assembly_get_image == nullptr || m_image_get_class == nullptr)
+        return nullptr;
+    Il2CppImage* image = m_assembly_get_image(assembly);
+    if (image == nullptr) return nullptr;
+    const size_t count = m_image_get_class_count != nullptr ? m_image_get_class_count(image) : 0;
+    if (static_cast<size_t>(index) >= count) return nullptr;
+    return m_image_get_class(image, static_cast<size_t>(index));
 }
 
 // ============================================================
@@ -379,7 +489,7 @@ Il2CppClass* Il2CppResolver::GetClass(const std::string& namespaze, const std::s
 // ============================================================
 
 // 获取类名（不含命名空间）
-const char* Il2CppResolver::GetKlassName(Il2CppClass* klass) const
+const char* Il2CppResolver::GetClassSimpleName(Il2CppClass* klass) const
 {
     // 空指针检查
     if (klass == nullptr || m_class_get_name == nullptr) return nullptr;
@@ -413,6 +523,21 @@ const Il2CppType* Il2CppResolver::GetClassType(Il2CppClass* klass) const
 {
     if (klass == nullptr || m_class_get_type == nullptr) return nullptr;
     return m_class_get_type(klass);
+}
+
+bool Il2CppResolver::IsValueType(Il2CppClass* klass) const
+{
+    if (klass == nullptr) return false;
+    if (m_class_is_valuetype != nullptr) return m_class_is_valuetype(klass);
+    const int32_t type = GetTypeEnum(GetClassType(klass));
+    return type == Il2CppTypeEnum::TYPE_VALUETYPE || type == Il2CppTypeEnum::TYPE_ENUM;
+}
+
+bool Il2CppResolver::IsEnum(Il2CppClass* klass) const
+{
+    if (klass == nullptr) return false;
+    if (m_class_is_enum != nullptr) return m_class_is_enum(klass);
+    return GetTypeEnum(GetClassType(klass)) == Il2CppTypeEnum::TYPE_ENUM;
 }
 
 // ============================================================
@@ -451,6 +576,13 @@ const char* Il2CppResolver::GetMethodName(const Il2CppMethod* method) const
 {
     if (method == nullptr || m_method_get_name == nullptr) return nullptr;
     return m_method_get_name(method);
+}
+
+// 指定位置参数的元数据名称
+const char* Il2CppResolver::GetMethodParamName(const Il2CppMethod* method, int32_t index) const
+{
+    if (method == nullptr || index < 0 || m_method_get_param_name == nullptr) return nullptr;
+    return m_method_get_param_name(method, index);
 }
 
 // 参数个数
@@ -502,6 +634,23 @@ Il2CppClass* Il2CppResolver::GetMethodClass(const Il2CppMethod* method) const
     return nullptr;
 }
 
+// 判断 source 实例是否可以作为 target 类型使用
+bool Il2CppResolver::IsAssignableFrom(Il2CppClass* target, Il2CppClass* source) const
+{
+    if (target == nullptr || source == nullptr) return false;
+    if (target == source) return true;
+    if (m_class_is_assignable_from != nullptr) return m_class_is_assignable_from(target, source);
+
+    // 旧版 Unity 缺少导出时，至少沿父类链检查普通类继承关系。
+    Il2CppClass* current = source;
+    while (current != nullptr)
+    {
+        if (current == target) return true;
+        current = GetClassParent(current);
+    }
+    return false;
+}
+
 // ========================================================
 // 线程与原生方法
 // ========================================================
@@ -542,6 +691,13 @@ const char* Il2CppResolver::GetFieldName(const Il2CppField* field) const
     return m_field_get_name(field);
 }
 
+// 字段声明所属的类
+Il2CppClass* Il2CppResolver::GetFieldClass(const Il2CppField* field) const
+{
+    if (field == nullptr || m_field_get_parent == nullptr) return nullptr;
+    return m_field_get_parent(field);
+}
+
 // 字段类型
 const Il2CppType* Il2CppResolver::GetFieldType(const Il2CppField* field) const
 {
@@ -556,6 +712,18 @@ int32_t Il2CppResolver::GetFieldOffset(const Il2CppField* field) const
 {
     if (field == nullptr || m_field_get_offset == nullptr) return 0;
     return m_field_get_offset(field);
+}
+
+uint32_t Il2CppResolver::GetFieldFlags(const Il2CppField* field) const
+{
+    return field != nullptr && m_field_get_flags != nullptr ? m_field_get_flags(field) : 0;
+}
+
+bool Il2CppResolver::IsStaticField(const Il2CppField* field) const
+{
+    // System.Reflection.FieldAttributes.Static = 0x0010。
+    constexpr uint32_t FIELD_ATTRIBUTE_STATIC = 0x0010;
+    return (GetFieldFlags(field) & FIELD_ATTRIBUTE_STATIC) != 0;
 }
 
 // ============================================================

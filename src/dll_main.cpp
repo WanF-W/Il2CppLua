@@ -57,10 +57,6 @@ static HMODULE g_hSelfModule = nullptr;
 // 工作线程句柄（用于资源管理）
 static HANDLE g_hWorkerThread = nullptr;
 
-// 工作线程是否正在运行（用于 DLL_PROCESS_DETACH 判断）
-static volatile bool g_workerRunning = false;
-
-
 // ============================================================
 // 工作线程主函数声明
 // ============================================================
@@ -147,9 +143,6 @@ BOOL APIENTRY DllMain(HMODULE hModule,            // DLL 模块句柄
 // SEH 包装由 WorkerThreadProc 负责 
 static void DllWorkerMain()
 {
-    // 标记工作线程正在运行
-    g_workerRunning = true;
-
     // ========================================================
     // 初始化管道通信
     // ========================================================
@@ -159,7 +152,6 @@ static void DllWorkerMain()
     {
         // 管道初始化失败：可能是共享内存不存在（DLL 不是通过注入器加载）
         // 直接退出 工作线程将自卸载
-        g_workerRunning = false;
         return;
     }
 
@@ -190,11 +182,11 @@ static void DllWorkerMain()
         // IL2CPP 初始化失败：发送错误并退出
         PipeChannel::Instance().SendError("failed to initialize IL2CPP resolver (GameAssembly.dll not found or exports missing)");
         PipeChannel::Instance().Shutdown();
-        g_workerRunning = false;
         return;
     }
 
-    if (!Il2CppResolver::Instance().IsNoFailedFunctions()) PipeChannel::Instance().SendLog("[Waring] Have No Found Il2Cpp Functions.");
+    if (Il2CppResolver::Instance().HasMissingExports())
+        PipeChannel::Instance().SendLog("[warning] some optional IL2CPP exports could not be resolved");
 
     // ========================================================
     // 初始化 Lua 引擎
@@ -214,7 +206,6 @@ static void DllWorkerMain()
         PipeChannel::Instance().SendError("failed to initialize Lua engine");
         Il2CppResolver::Instance().Shutdown();
         PipeChannel::Instance().Shutdown();
-        g_workerRunning = false;
         return;
     }
 
@@ -310,8 +301,6 @@ exit_loop:
     // 关闭管道通信
     PipeChannel::Instance().Shutdown();
 
-    // 标记工作线程结束
-    g_workerRunning = false;
 }
 
 

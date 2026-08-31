@@ -1,10 +1,9 @@
 /**
  * ============================================================
- * lua_bridge.h — Lua ↔ IL2CPP 桥接层声明
+ * lua_bridge.h — Lua ↔ IL2CPP 桥接层公共声明
  * ============================================================
- * 本模块是整个项目的核心
- * 它将 IL2CPP 的类/对象/方法/字段映射为
- * Lua 的 userdata 并为每种类型创建一张元表 (metatable) 
+ * 定义桥接层生命周期、userdata 布局以及 Hook 所需的公共值转换接口。
+ * 具体 Lua API 实现在 lua_binding_*.cpp 中。
  *
  * 用户在 Lua 中通过以下方式操作 IL2CPP 运行时
  *
@@ -12,15 +11,16 @@
  * ·local method = cls:get_method("GetPosition")
  * ·local obj = cls:new()
  * ·obj:call("SetPosition", 1, 2, 3)
- * ·local x = obj:get("position_x")
- * ·obj:set("position_x", 10)
- * ·il2cpp.mainThread.schedule(function() ... end) -- 排队到主线程执行
- * ·il2cpp.each(container, fn)  -- 遍历 Lua 表 / 数组 / List<T>
- * ·il2cpp.dump(container)      -- 输出容器长度与全部元素
+ * ·local x = obj:read_field("position_x")
+ * ·obj:write_field("position_x", 10)
+ * ·il2cpp.schedule(function() ... end) -- 排队到 Unity 主线程执行
+ * ·lua.each(table, fn)         -- 遍历 Lua table
+ * ·lua.dump(table)             -- 输出 Lua table 的第一层键值
  * ·obj:call(name, ...)         -- 按名称调用 同名重载自动匹配
  *
- * 四种 userdata 类型
+ * 五种 userdata 类型
  * 
+ * ·Assembly — IL2CPP 程序集的引用 (Il2CppAssembly*)
  * ·Class    — IL2CPP 类的引用 (Il2CppClass*)
  * ·Instance — IL2CPP 对象实例 (Il2CppObject*)
  * ·Method   — IL2CPP 方法的引用 (Il2CppMethod*)
@@ -31,7 +31,6 @@
  */
 #pragma once
 #include "common.h"
-#include "il2cpp_resolver.h"
 
 // Lua 状态机前置声明
 struct lua_State;
@@ -42,6 +41,7 @@ struct lua_State;
 // 这些名称存储在 Lua registry 中 用于创建和识别 userdata 类型
 namespace LuaBridgeMT
 {
+    constexpr const char* ASSEMBLY = "Il2CppLua.Assembly";  // 程序集元表名
     constexpr const char* CLASS    = "Il2CppLua.Class";     // 类元表名
     constexpr const char* INSTANCE = "Il2CppLua.Instance";  // 实例元表名
     constexpr const char* METHOD   = "Il2CppLua.Method";    // 方法元表名
@@ -54,8 +54,13 @@ namespace LuaBridgeMT
 // 每种 userdata 都是一个固定大小的内存块 存储对应的 IL2CPP 指针 
 // Lua 通过 lua_newuserdata 分配 并关联到对应的元表 
 
+struct LuaAssemblyUD
+{
+    Il2CppAssembly* assembly;
+};
+
 // Class userdata — 包装 Il2CppClass*
-// method - IL2CPP 类指针
+// klass - IL2CPP 类指针
 struct LuaClassUD
 {
     Il2CppClass* klass;
@@ -63,7 +68,7 @@ struct LuaClassUD
 
 // Instance userdata — 包装 Il2CppObject*
 // obj - IL2CPP 对象指针（可能为 null）
-// klass - 字段所属的类
+// klass - 对象实际类或创建 userdata 时已知的类
 struct LuaInstanceUD
 {
     Il2CppObject* obj;
@@ -72,7 +77,7 @@ struct LuaInstanceUD
 
 // Method userdata — 包装 const Il2CppMethod*
 // method - IL2CPP 方法指针
-// klass - 字段所属的类
+// klass - 方法声明类
 struct LuaMethodUD
 {
     const Il2CppMethod* method;
@@ -94,7 +99,7 @@ struct LuaFieldUD
 
 /**
  * 初始化桥接层
- * 创建 4 张元表并注册 il2cpp 全局表
+ * 创建五张 userdata 元表并注册 il2cpp 与 lua 全局表
  * @param L Lua 状态机
  * @return true 成功
  */
@@ -104,6 +109,9 @@ bool LuaBridge_Init(lua_State* L);
 // Userdata 创建辅助函数
 // ============================================================
 // 这些函数创建 userdata 并关联到正确的元表 然后压入 Lua 栈
+
+// 创建 Assembly userdata 并压栈
+void LuaBridge_PushAssembly(lua_State* L, Il2CppAssembly* assembly);
 
 // 创建 Class userdata 并压栈
 void LuaBridge_PushClass(lua_State* L, Il2CppClass* klass);
@@ -128,6 +136,7 @@ void LuaBridge_PushString(lua_State* L, Il2CppString* str);
 // 检查指定位置的 Lua 值是否为对应类型的 userdata
 // 返回指向 userdata 结构的指针 类型不匹配返回 nullptr
 
+LuaAssemblyUD* LuaBridge_CheckAssembly(lua_State* L, int idx);
 LuaClassUD* LuaBridge_CheckClass(lua_State* L, int idx);
 LuaInstanceUD* LuaBridge_CheckInstance(lua_State* L, int idx);
 LuaMethodUD* LuaBridge_CheckMethod(lua_State* L, int idx);
@@ -142,15 +151,16 @@ LuaFieldUD* LuaBridge_CheckField(lua_State* L, int idx);
  * @param L           Lua 状态机
  * @param result      runtime_invoke 返回的 Il2CppObject*
  * @param returnType  方法返回值类型（可为 nullptr 表示 void）
+ * @return 实际压入的 Lua 值数量；void 为 0，其他类型为 1
  */
-void LuaBridge_PushReturnValue(lua_State* L, Il2CppObject* result, const Il2CppType* returnType);
+int LuaBridge_PushReturnValue(lua_State* L, Il2CppObject* result, const Il2CppType* returnType);
 
 /**
  * 将 Lua 栈上的值编组为 C# 参数（与 mth:call 使用同一套逻辑）
  * @param L           Lua 状态机
  * @param idx         Lua 栈上参数位置
  * @param type        IL2CPP 参数类型
- * @param storage     至少 16 字节的存储区（基本类型/值类型写入）
+ * W@param storage     至少 16 字节的存储区（基本类型/值类型写入）
  * @param outParam    输出: 供 runtime_invoke 使用的参数指针
  * @return true 编组成功
  */

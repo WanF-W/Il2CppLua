@@ -25,6 +25,9 @@
 #include <mutex>      // std::mutex, std::lock_guard
 #include <functional> // std::function（输出回调）
 #include <utility>    // std::pair, std::move
+#include <algorithm>  // std::transform
+#include <cctype>     // std::tolower
+#include <climits>    // INT32_MAX
 
 // ============================================================
 // 统一错误码

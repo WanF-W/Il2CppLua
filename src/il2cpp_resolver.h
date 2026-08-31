@@ -48,8 +48,9 @@ public:
     // 获取 Il2CppResolver 类的基础字段
     bool IsInitialized() const { return m_initialized; }
     int GetImageCount() const { return static_cast<int>(m_imageCache.size()); }
+    int GetAssemblyCount() const { return static_cast<int>(m_assemblyCache.size()); }
     Il2CppDomain* GetDomain() const { return m_domain; }
-    bool IsNoFailedFunctions() const { return m_failedFunctions.empty(); }
+    bool HasMissingExports() const { return !m_failedFunctions.empty(); }
 
     // ========================================================
     // 线程与原生方法
@@ -66,12 +67,24 @@ public:
     std::string GetResolveStatus() const;
 
     // ========================================================
+    // 程序集与镜像
+    // ========================================================
+    Il2CppAssembly* GetAssemblyAt(int32_t index) const;
+    Il2CppAssembly* GetAssembly(const std::string& name) const;
+    const char* GetAssemblyName(Il2CppAssembly* assembly) const;
+    Il2CppAssembly* GetClassAssembly(Il2CppClass* klass) const;
+    Il2CppClass* GetClass(Il2CppAssembly* assembly, const std::string& namespaze,
+        const std::string& className) const;
+    int32_t GetAssemblyClassCount(Il2CppAssembly* assembly) const;
+    Il2CppClass* GetAssemblyClassAt(Il2CppAssembly* assembly, int32_t index) const;
+
+    // ========================================================
     // 类查找与信息
     // ========================================================
     // 按命名空间+类名查找 结果缓存
     Il2CppClass* GetClass(const std::string& namespaze, const std::string& className);
     // 获取类名
-    const char* GetKlassName(Il2CppClass* klass) const;
+    const char* GetClassSimpleName(Il2CppClass* klass) const;
     // 获取命名空间名
     const char* GetClassNamespace(Il2CppClass* klass) const;
     // 获取父类
@@ -80,6 +93,9 @@ public:
     int32_t GetClassInstanceSize(Il2CppClass* klass) const;
     // 获取类的 Il2CppType*
     const Il2CppType* GetClassType(Il2CppClass* klass) const;
+    // 判断类是否为值类型 / 枚举
+    bool IsValueType(Il2CppClass* klass) const;
+    bool IsEnum(Il2CppClass* klass) const;
 
     // ========================================================
     // 方法查找与信息
@@ -88,6 +104,7 @@ public:
     const Il2CppMethod* GetMethod(Il2CppClass* klass, const std::string& name) const;
     // 获取方法名
     const char* GetMethodName(const Il2CppMethod* method) const;
+    const char* GetMethodParamName(const Il2CppMethod* method, int32_t index) const;
     // 参数个数
     int32_t GetMethodParamCount(const Il2CppMethod* method) const;
     // 获取返回值类型
@@ -100,6 +117,7 @@ public:
     bool IsStaticMethod(const Il2CppMethod* method) const;
     // 获取方法所属的类
     Il2CppClass* GetMethodClass(const Il2CppMethod* method) const;
+    bool IsAssignableFrom(Il2CppClass* target, Il2CppClass* source) const;
 
     // ========================================================
     // 字段查找与信息
@@ -108,10 +126,13 @@ public:
     const Il2CppField* GetField(Il2CppClass* klass, const std::string& name) const;
     // 获取字段名
     const char* GetFieldName(const Il2CppField* field) const;
+    Il2CppClass* GetFieldClass(const Il2CppField* field) const;
     // 获取字段类型
     const Il2CppType* GetFieldType(const Il2CppField* field) const;
     // 获取字段偏移（在对象内的字节偏移）
     int32_t GetFieldOffset(const Il2CppField* field) const;
+    uint32_t GetFieldFlags(const Il2CppField* field) const;
+    bool IsStaticField(const Il2CppField* field) const;
 
     // ========================================================
     // 字段读写
@@ -216,6 +237,10 @@ private:
     typedef Il2CppDomain* (*pfn_domain_get)();
     typedef Il2CppAssembly** (*pfn_domain_get_assemblies)(Il2CppDomain*, size_t*);
     typedef Il2CppImage* (*pfn_assembly_get_image)(const Il2CppAssembly*);
+    typedef const Il2CppAssembly* (*pfn_image_get_assembly)(const Il2CppImage*);
+    typedef const char* (*pfn_image_get_name)(const Il2CppImage*);
+    typedef size_t (*pfn_image_get_class_count)(const Il2CppImage*);
+    typedef Il2CppClass* (*pfn_image_get_class)(const Il2CppImage*, size_t);
 
     // --- 线程 ---
     typedef Il2CppThread* (*pfn_thread_attach)(Il2CppDomain*);
@@ -223,6 +248,9 @@ private:
 
     // --- 类 ---
     typedef Il2CppClass* (*pfn_class_from_name)(const Il2CppImage*, const char*, const char*);
+    typedef const Il2CppImage* (*pfn_class_get_image)(Il2CppClass*);
+    typedef bool (*pfn_class_is_valuetype)(Il2CppClass*);
+    typedef bool (*pfn_class_is_enum)(Il2CppClass*);
     typedef const char* (*pfn_class_get_name)(Il2CppClass*);
     typedef const char* (*pfn_class_get_namespace)(Il2CppClass*);
     typedef Il2CppClass* (*pfn_class_get_parent)(Il2CppClass*);
@@ -236,18 +264,22 @@ private:
     typedef const Il2CppMethod* (*pfn_class_get_method_from_name)(Il2CppClass*, const char*, int);
     typedef const Il2CppMethod* (*pfn_class_get_methods)(Il2CppClass*, void**);
     typedef const char* (*pfn_method_get_name)(const Il2CppMethod*);
+    typedef const char* (*pfn_method_get_param_name)(const Il2CppMethod*, int);
     typedef int32_t (*pfn_method_get_param_count)(const Il2CppMethod*);
     typedef const Il2CppType* (*pfn_method_get_return_type)(const Il2CppMethod*);
     typedef const Il2CppType* (*pfn_method_get_param)(const Il2CppMethod*, int);
     // 官方签名: uint32_t il2cpp_method_get_flags(const MethodInfo*, uint32_t* iflags)
     typedef uint32_t (*pfn_method_get_flags)(const Il2CppMethod*, uint32_t*);
+    typedef bool (*pfn_class_is_assignable_from)(Il2CppClass*, Il2CppClass*);
 
     // --- 字段 ---
     typedef const Il2CppField* (*pfn_class_get_field_from_name)(Il2CppClass*, const char*);
     typedef const Il2CppField* (*pfn_class_get_fields)(Il2CppClass*, void**);
     typedef const char* (*pfn_field_get_name)(const Il2CppField*);
+    typedef Il2CppClass* (*pfn_field_get_parent)(const Il2CppField*);
     typedef const Il2CppType* (*pfn_field_get_type)(const Il2CppField*);
     typedef int32_t (*pfn_field_get_offset)(const Il2CppField*);
+    typedef uint32_t (*pfn_field_get_flags)(const Il2CppField*);
     typedef void (*pfn_field_get_value)(Il2CppObject*, const Il2CppField*, void*);
     typedef void (*pfn_field_set_value)(Il2CppObject*, const Il2CppField*, void*);
     typedef void (*pfn_field_static_get_value)(const Il2CppField*, void*);
@@ -285,9 +317,16 @@ private:
     pfn_domain_get m_domain_get = nullptr;
     pfn_domain_get_assemblies m_domain_get_assemblies = nullptr;
     pfn_assembly_get_image m_assembly_get_image = nullptr;
+    pfn_image_get_assembly m_image_get_assembly = nullptr;
+    pfn_image_get_name m_image_get_name = nullptr;
+    pfn_image_get_class_count m_image_get_class_count = nullptr;
+    pfn_image_get_class m_image_get_class = nullptr;
     pfn_thread_attach m_thread_attach = nullptr;
     pfn_thread_detach m_thread_detach = nullptr;
     pfn_class_from_name m_class_from_name = nullptr;
+    pfn_class_get_image m_class_get_image = nullptr;
+    pfn_class_is_valuetype m_class_is_valuetype = nullptr;
+    pfn_class_is_enum m_class_is_enum = nullptr;
     pfn_class_get_name m_class_get_name = nullptr;
     pfn_class_get_namespace m_class_get_namespace = nullptr;
     pfn_class_get_parent m_class_get_parent = nullptr;
@@ -299,15 +338,19 @@ private:
     pfn_class_get_method_from_name m_class_get_method_from_name = nullptr;
     pfn_class_get_methods m_class_get_methods = nullptr;
     pfn_method_get_name m_method_get_name = nullptr;
+    pfn_method_get_param_name m_method_get_param_name = nullptr;
     pfn_method_get_param_count m_method_get_param_count = nullptr;
     pfn_method_get_return_type m_method_get_return_type = nullptr;
     pfn_method_get_param m_method_get_param = nullptr;
     pfn_method_get_flags m_method_get_flags = nullptr;
+    pfn_class_is_assignable_from m_class_is_assignable_from = nullptr;
     pfn_class_get_field_from_name m_class_get_field_from_name = nullptr;
     pfn_class_get_fields m_class_get_fields = nullptr;
     pfn_field_get_name m_field_get_name = nullptr;
+    pfn_field_get_parent m_field_get_parent = nullptr;
     pfn_field_get_type  m_field_get_type = nullptr;
     pfn_field_get_offset  m_field_get_offset = nullptr;
+    pfn_field_get_flags m_field_get_flags = nullptr;
     pfn_field_get_value m_field_get_value = nullptr;
     pfn_field_set_value m_field_set_value = nullptr;
     pfn_field_static_get_value m_field_static_get_value = nullptr;
@@ -339,7 +382,8 @@ private:
     Il2CppDomain* m_domain = nullptr;
     // 已 attach 的线程
     Il2CppThread* m_thread = nullptr;
-    // 全量 Image 缓存
+    // Assembly 与 Image 按相同下标对应缓存
+    std::vector<Il2CppAssembly*> m_assemblyCache;
     std::vector<Il2CppImage*> m_imageCache;
     // 类缓存：key = (命名空间, 类名)
     std::map<std::pair<std::string, std::string>, Il2CppClass*> m_classCache;

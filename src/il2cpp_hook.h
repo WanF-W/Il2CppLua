@@ -9,10 +9,8 @@
  * 
  * ·mth:hook(function(this, original, ...) ... end) -- 替换方法实现
  * ·mth:unhook()                           -- 恢复原始实现
- * ·mth:hooked()                           -- 查询是否已 Hook
+ * ·mth:is_hooked()                        -- 查询是否已 Hook
  * ·il2cpp.unhook_all()                    -- 卸载全部 Hook
- * ·il2cpp.mainThread.schedule(fn)         -- 排队到 Unity 主线程执行
- * ·il2cpp.mainThread.set_tick(...)        -- 指定主线程 tick 入口方法
  *
  * 回调签名与 frida-il2cpp-bridge 一致
  * 
@@ -30,14 +28,6 @@
  * ·回调内部先附加 IL2CPP 线程 再获取 Lua 状态机互斥锁
  * ·LuaEngine 使用可重入互斥锁 支持回调内再次调用被 Hook 的方法
  * ·卸载时只禁用 Hook 不释放 trampoline 避免在途回调悬空
- *
- * 主线程调度（参考 frida-il2cpp-bridge 的 Il2Cpp.mainThread.schedule）
- *
- * ·schedule 只把 Lua 函数引用放入队列 立即返回
- * ·内部 tick hook 挂在一个每帧必调且只在主线程调用的 Unity 方法上
- *   （默认依次尝试 Time.get_deltaTime / Time.get_frameCount / Object.get_name）
- * ·主线程执行到该入口时 分发器把队列里的函数逐个取出来执行
- * ·tick hook 始终保持回跳原方法 不影响游戏行为
  *
  * 仅针对 Windows x64（MS x64 调用约定）
  * 假定 Unity 2018.3+（静态方法不再携带无用的 __this 参数）
@@ -87,43 +77,9 @@ namespace Il2CppHook
      */
     void UnhookAll();
 
-    /**
-     * 主线程调度：把一个 Lua 函数加入队列
-     * 由内部 tick hook 在 Unity 主线程发现并执行
-     *
-     * @param L          Lua 状态机
-     * @param callbackIdx Lua 栈上函数的位置
-     * @return true 已入队（首次调用会尝试安装内部 tick hook）
-     */
-    bool MainThreadSchedule(lua_State* L, int callbackIdx);
-
-    /**
-     * 指定内部 tick 入口方法（替换默认候选）
-     * 用于游戏完全不调用默认入口方法的情况
-     *
-     * @param namespaze 类命名空间（可传空字符串）
-     * @param klass     类名
-     * @param method    方法名
-     * @return true 安装成功
-     */
-    bool SetMainThreadTickTarget(const char* namespaze, const char* klass, const char* method);
-
-    /**
-     * 查询当前内部 tick 入口方法
-     */
-    bool GetMainThreadTickTarget(std::string& namespaze, std::string& klass, std::string& method);
-
-    /**
-     * 查询内部 tick hook 是否已安装
-     */
-    bool IsMainThreadTickInstalled();
-
-    /**
-     * 确保内部主线程 tick hook 已安装
-     * 初始化时预装 让 il2cpp.mainThread.is_ready() 初始即为 true
-     * 预装失败不阻塞初始化 首次 schedule 时会重试
-     */
-    bool EnsureMainThreadTickInstalled();
+    // Scheduler 的 Hook 后端，不直接暴露给 Lua。
+    bool InstallSchedulerTick(const Il2CppMethod* method, Il2CppClass* klass);
+    bool IsSchedulerTickInstalled();
 
     /**
      * 关闭模块
