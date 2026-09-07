@@ -28,7 +28,6 @@
 - [通信与版本校验](#protocol-version)
 - [Lune 命令行](#lune-cli)
 - [构建](#build)
-- [验证与测试脚本](#verification)
 - [已知限制](#limitations)
 - [License](#license)
 
@@ -1003,17 +1002,6 @@ MASM x64 构建支持。
 源码中的 `src/hook_stub.asm` 必须由 MASM 编译；如果只使用命令行编译器检查 C++，仍需单独
 编译该文件，不能把 Hook 跳板替换成普通 C++ 函数。`lua_src/` 和 `minhook_src/` 是项目
 随附的第三方实现，业务修改应集中在 `src/`。
-
-<a id="verification"></a>
-
-## 验证与测试脚本
-
-4.0.0 修复 `lua.each` 非数组键回调参数错误，以及无参、非 void 方法返回值丢失后，
-维护者已确认功能测试通过。发布前的源码与文档整理不等同于重新执行测试。
-
-[scripts/longyin_api_test.lua](scripts/longyin_api_test.lua) 是针对《龙胤立志传》的手动功能测试脚本，
-依赖该游戏的类型和场景，不能直接用于其他游戏。使用前阅读脚本头部说明；其中包含对象创建、
-字段写入、Hook 和异步调度，适合独立测试会话。它不验证 DLL 卸载并发、通信边界或原生资源泄漏。
 
 <a id="limitations"></a>
 
