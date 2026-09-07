@@ -1,11 +1,9 @@
 /**
- * ============================================================
  * dll_main.cpp — Il2CppLua DLL 入口点
- * ============================================================
- * 本文件是注入到游戏进程中的 Il2CppLua.dll 的主入口 
+ * 本文件是注入到游戏进程中的 Il2CppLua.dll 的主入口
  *
  * 工作流程
- * 
+ *
  * ·DllMain(DLL_PROCESS_ATTACH)：保存模块句柄 创建工作线程
  * ·工作线程执行 DllWorkerMain()：
  *   ·PipeChannel::Init()    — 连接管道
@@ -18,7 +16,7 @@
  * ·FreeLibraryAndExitThread()：自卸载 DLL
  *
  * 设计要点
- * 
+ *
  * ·DllMain 中不做耗时操作（Loader Lock 限制）
  * ·所有初始化在工作线程中完成
  * ·整个工作线程包裹在 SEH __try/__except 中
@@ -26,8 +24,7 @@
  * ·管道断开时自动退出并卸载
  * ·GameAssembly.dll 可能尚未加载 需重试等待
  *
- * 仅针对 Windows x64 
- * ============================================================
+ * 仅针对 Windows x64
  */
 
 #include "pipe_channel.h"
@@ -39,40 +36,69 @@
 // Windows API
 #include <windows.h>
 #include <cstdio>
+#include <string>
+#include <vector>
 
-// Lua C API（LUA_NOREF 等常量定义在 lauxlib.h 中）
-extern "C" {
-#include "lua.h"
-#include "lauxlib.h"
-}
-
-
-// ============================================================
 // 全局变量
-// ============================================================
-
 // DLL 自身模块句柄（用于自卸载）
 static HMODULE g_hSelfModule = nullptr;
 
 // 工作线程句柄（用于资源管理）
 static HANDLE g_hWorkerThread = nullptr;
 
-// ============================================================
+// 以作用域管理当前线程的 IL2CPP attach 状态。
+// 命令执行、异常退出和未来新增的提前返回都必须保证成对 detach，
+// 否则短时间内虽然看不出问题，长期运行会把工作线程留在 IL2CPP 线程表中。
+class ScopedIl2CppAttach final
+{
+public:
+    ScopedIl2CppAttach(Il2CppResolver& resolver, bool attach)
+        : m_resolver(resolver), m_thread(attach ? resolver.AttachThread() : nullptr)
+    {
+    }
+
+    ~ScopedIl2CppAttach() noexcept
+    {
+        if (m_thread != nullptr) m_resolver.DetachThread(m_thread);
+    }
+
+    ScopedIl2CppAttach(const ScopedIl2CppAttach&) = delete;
+    ScopedIl2CppAttach& operator=(const ScopedIl2CppAttach&) = delete;
+
+    bool IsAttached() const noexcept { return m_thread != nullptr; }
+
+private:
+    Il2CppResolver& m_resolver;
+    Il2CppThread* m_thread = nullptr;
+};
+
 // 工作线程主函数声明
-// ============================================================
 // 实际的工作线程实现（包含 C++ 对象 不能放在 __try 中）
+static void ShutdownBridge()
+{
+    auto& resolver = Il2CppResolver::Instance();
+    // 正常消息循环期间 Init 线程已经脱离；清理 Lua userdata 时临时附着，
+    // 这样 GCHandle 等 IL2CPP 资源仍在运行时有效时释放。
+    const bool hasInitializationThread = resolver.HasInitializationThread();
+    {
+        // Hook 在途调用退出后关闭 Lua，使所有 GCHandle 在 Resolver 仍可用时释放。
+        // 初始化线程仍然 attach 时复用它；否则只临时附加当前清理线程。
+        ScopedIl2CppAttach shutdownAttach(resolver, !hasInitializationThread);
+        Il2CppHook::Shutdown();
+        LuaEngine::Instance().Shutdown();
+    }
+    resolver.Shutdown();
+    PipeChannel::Instance().Shutdown();
+}
+
 static void DllWorkerMain();
 
 // 工作线程入口（SEH 包装 + 自卸载）
 static DWORD WINAPI WorkerThreadProc(LPVOID lpParam);
-
-
-// ============================================================
 // DllMain — DLL 入口点
-// ============================================================
-// Windows 在 DLL 加载/卸载时调用此函数 
+// Windows 在 DLL 加载/卸载时调用此函数
 // 注意：DllMain 持有 Loader Lock 不能做耗时操作、不能调用
-// 某些 API（如 CreateThread 以外的线程同步函数） 
+// 某些 API（如 CreateThread 以外的线程同步函数）
 BOOL APIENTRY DllMain(HMODULE hModule,            // DLL 模块句柄
                       DWORD   ul_reason_for_call, // 调用原因
                       LPVOID  lpReserved)         // 保留参数
@@ -112,7 +138,13 @@ BOOL APIENTRY DllMain(HMODULE hModule,            // DLL 模块句柄
     {
         // ---- DLL 从进程地址空间卸载 ----
 
-        // 如果工作线程仍在运行（如进程退出时） 
+        // lpReserved 非空表示进程正在退出。此时不要让 DLL 静态对象的
+        // 析构路径再等待 overlapped I/O 或其他游戏线程；操作系统会回收
+        // 进程内资源，正常的自卸载仍然走 WorkerThreadProc 的显式清理。
+        if (lpReserved != nullptr)
+            bridge_lifecycle::g_processTerminating.store(true, std::memory_order_release);
+
+        // 如果工作线程仍在运行（如进程退出时）
         // 不做特殊处理——OS 会强制终止线程并回收资源
         // 正常情况下 工作线程已通过 FreeLibraryAndExitThread 自卸载
 
@@ -134,19 +166,12 @@ BOOL APIENTRY DllMain(HMODULE hModule,            // DLL 模块句柄
 
     return TRUE;
 }
-
-
-// ============================================================
 // 工作线程主函数（实际实现）
-// ============================================================
-// 此函数包含 C++ 对象（std::string 等） 因此不能放在 __try 中 
-// SEH 包装由 WorkerThreadProc 负责 
+// 此函数包含 C++ 对象（std::string 等） 因此不能放在 __try 中
+// SEH 包装由 WorkerThreadProc 负责
 static void DllWorkerMain()
 {
-    // ========================================================
     // 初始化管道通信
-    // ========================================================
-
     // PipeChannel::Init 从共享内存读取管道名并连接
     if (!PipeChannel::Instance().Init())
     {
@@ -158,11 +183,7 @@ static void DllWorkerMain()
     // 发送握手帧（版本字符串）
     // EXE 收到后检查版本是否匹配
     PipeChannel::Instance().SendHello();
-
-    // ========================================================
     // 初始化 IL2CPP 运行时桥接
-    // ========================================================
-
     // GameAssembly.dll 可能尚未加载（游戏启动早期）
     // 重试等待最多 30 秒（60 次 × 500ms）
     BridgeResult il2cppResult = BridgeResult::ERR_IL2CPP_RESOLVE_FAILED;
@@ -180,18 +201,15 @@ static void DllWorkerMain()
     if (il2cppResult != BridgeResult::OK)
     {
         // IL2CPP 初始化失败：发送错误并退出
-        PipeChannel::Instance().SendError("failed to initialize IL2CPP resolver (GameAssembly.dll not found or exports missing)");
+        PipeChannel::Instance().SendError(
+            protocol::ErrorCategory::Il2Cpp,
+            -1,
+            "failed to initialize IL2CPP resolver (GameAssembly.dll not found or exports missing)");
         PipeChannel::Instance().Shutdown();
         return;
     }
 
-    if (Il2CppResolver::Instance().HasMissingExports())
-        PipeChannel::Instance().SendLog("[warning] some optional IL2CPP exports could not be resolved");
-
-    // ========================================================
     // 初始化 Lua 引擎
-    // ========================================================
-
     // 创建 Lua 虚拟机并注册 IL2CPP 桥接函数
     // 输出回调：Lua 的 print 输出和返回值回显通过管道发送给 EXE
     if (!LuaEngine::Instance().Init(
@@ -203,25 +221,25 @@ static void DllWorkerMain()
             }))
     {
         // Lua 初始化失败
-        PipeChannel::Instance().SendError("failed to initialize Lua engine");
+        PipeChannel::Instance().SendError(
+            protocol::ErrorCategory::Lua,
+            -1,
+            "failed to initialize Lua engine");
         Il2CppResolver::Instance().Shutdown();
         PipeChannel::Instance().Shutdown();
         return;
     }
-
-    // ========================================================
     // 通知 EXE：就绪
-    // ========================================================
-
     // 构造状态消息 包含 IL2CPP 镜像数量
     char statusMsg[256];
     sprintf_s(statusMsg, 256, "IL2CPP resolved: %d images, Lua ready", Il2CppResolver::Instance().GetImageCount());
     PipeChannel::Instance().SendReady(statusMsg);
 
-    // ========================================================
-    // 消息循环
-    // ========================================================
+    // 空闲等待命令时不要让游戏运行时把这个线程视为长期活动的托管线程。
+    // 每条命令会在执行前重新 Attach，执行完立即 Detach。
+    Il2CppResolver::Instance().DetachInitializationThread();
 
+    // 消息循环
     // 循环接收 EXE 发来的命令帧并执行
     while (true)
     {
@@ -242,13 +260,31 @@ static void DllWorkerMain()
             // payload 中不包含零终止符 需要手动添加
             std::string code(payload.begin(), payload.end());
 
+            Il2CppResolver& resolver = Il2CppResolver::Instance();
+            ScopedIl2CppAttach commandAttach(resolver, true);
+            if (!commandAttach.IsAttached())
+            {
+                PipeChannel::Instance().SendError(
+                    protocol::ErrorCategory::Il2Cpp,
+                    -1,
+                    "failed to attach command thread to IL2CPP runtime");
+                goto exit_loop;
+            }
+
             // 执行 Lua 代码
             // LuaEngine 内部会将 print 输出和返回值通过管道回传
             bool ok = LuaEngine::Instance().ExecuteString(code.c_str());
 
             // 根据执行结果发送 OK 或 ERROR
-            if (ok) PipeChannel::Instance().SendOk();
-            else PipeChannel::Instance().SendError("execution failed");
+            if (ok)
+            {
+                PipeChannel::Instance().SendOk();
+            }
+            else
+            {
+                const auto error = LuaEngine::Instance().GetLastError();
+                PipeChannel::Instance().SendError(error.category, error.line, error.message.c_str());
+            }
         }
         break;
 
@@ -258,12 +294,30 @@ static void DllWorkerMain()
             // 负载为文件路径
             std::string path(payload.begin(), payload.end());
 
+            Il2CppResolver& resolver = Il2CppResolver::Instance();
+            ScopedIl2CppAttach commandAttach(resolver, true);
+            if (!commandAttach.IsAttached())
+            {
+                PipeChannel::Instance().SendError(
+                    protocol::ErrorCategory::Il2Cpp,
+                    -1,
+                    "failed to attach command thread to IL2CPP runtime");
+                goto exit_loop;
+            }
+
             // 执行 Lua 文件
             bool ok = LuaEngine::Instance().ExecuteFile(path.c_str());
 
             // 根据执行结果发送 OK 或 ERROR
-            if (ok) PipeChannel::Instance().SendOk();
-            else PipeChannel::Instance().SendError("file execution failed");
+            if (ok)
+            {
+                PipeChannel::Instance().SendOk();
+            }
+            else
+            {
+                const auto error = LuaEngine::Instance().GetLastError();
+                PipeChannel::Instance().SendError(error.category, error.line, error.message.c_str());
+            }
         }
         break;
 
@@ -283,33 +337,13 @@ static void DllWorkerMain()
         }
     }
 exit_loop:
-
-    // ========================================================
-    // 清理（逆序关闭各模块）
-    // ========================================================
-
-    // 卸载全部 Hook（必须在 LuaEngine::Shutdown 之前
-    // 保证回调的 Lua 引用在释放时仍然有效）
-    Il2CppHook::Shutdown();
-
-    // 关闭 Lua 引擎
-    LuaEngine::Instance().Shutdown();
-
-    // 关闭 IL2CPP 解析器（detach 线程 清空缓存）
-    Il2CppResolver::Instance().Shutdown();
-
-    // 关闭管道通信
-    PipeChannel::Instance().Shutdown();
+    ShutdownBridge();
 
 }
-
-
-// ============================================================
 // 工作线程入口（SEH 包装 + 自卸载）
-// ============================================================
 // 此函数是 CreateThread 的回调 不能包含带析构函数的 C++ 对象
-// （因为使用了 __try/__except） 
-// 它将实际工作委托给 DllWorkerMain 并在完成后自卸载 DLL 
+// （因为使用了 __try/__except）
+// 它将实际工作委托给 DllWorkerMain 并在完成后自卸载 DLL
 static DWORD WINAPI WorkerThreadProc(LPVOID lpParam)
 {
     // 消除未使用参数警告
@@ -320,26 +354,23 @@ static DWORD WINAPI WorkerThreadProc(LPVOID lpParam)
     // 防止任何未捕获的访问违规导致游戏进程崩溃
     __try
     {
-        // 调用实际的工作线程实现
         DllWorkerMain();
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         // 捕获到致命的结构化异常
         // 尝试通知 EXE（管道可能已断开 忽略失败）
-        PipeChannel::Instance().SendError("fatal exception in worker thread");
+        PipeChannel::Instance().SendError(
+            protocol::ErrorCategory::Il2Cpp, -1, "fatal exception in worker thread");
 
         // 确保资源被清理
-        Il2CppHook::Shutdown();
-        LuaEngine::Instance().Shutdown();
-        Il2CppResolver::Instance().Shutdown();
-        PipeChannel::Instance().Shutdown();
+        ShutdownBridge();
     }
 
     // 自卸载
     // 工作线程结束后 DLL 不再需要驻留在进程地址空间中
     // FreeLibraryAndExitThread 会
-    // 
+    //
     // ·减少 DLL 的引用计数
     // ·终止当前线程
     // ·如果引用计数降为 0 DLL 被卸载（触发 DLL_PROCESS_DETACH）

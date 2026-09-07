@@ -4,7 +4,7 @@
 
 在 Unity IL2CPP 游戏进程中使用 Lua 检查类型、操作对象、调用方法与 Hook 逻辑
 
-**v3.0.0** · Windows x64 · Lua 5.4.8 · MIT
+**v4.0.0** · Windows x64 · Lua 5.4.8 · MIT
 
 </div>
 
@@ -12,6 +12,7 @@
 
 - [项目定位](#project-positioning)
 - [主要能力](#capabilities)
+- [内部架构与目录](#architecture)
 - [快速开始](#quick-start)
 - [API 模型](#api-model)
 - [API 参考](#api-reference)
@@ -25,12 +26,11 @@
 - [Lua 与 IL2CPP 类型映射](#type-mapping)
 - [Hook 与线程模型](#hook-threading)
 - [通信与版本校验](#protocol-version)
-- [ILune 命令行](#ilune-cli)
+- [Lune 命令行](#lune-cli)
 - [构建](#build)
+- [验证与测试脚本](#verification)
 - [已知限制](#limitations)
 - [License](#license)
-
-<a id="project-positioning"></a>
 
 ## 🎯 项目定位
 
@@ -38,8 +38,9 @@ Il2CppLua 是注入 Unity IL2CPP 游戏进程的原生运行时桥接 DLL。它�
 `GameAssembly.dll` 动态解析 IL2CPP API，将程序集、类、对象、方法和字段映射为
 Lua userdata，不依赖游戏 SDK 或预生成的 dump 头文件。
 
-配套控制台 [ILune](../ILune) 负责定位进程、注入 DLL、执行 Lua 文件和提供交互式
-REPL。v3.0.0 起，ILune 会严格校验 DLL 发送的 HELLO 版本；两个项目必须使用相同版本。
+配套控制台 Lune 负责定位进程、注入 DLL、执行 Lua 文件和提供交互式 REPL。
+使用 `-i` 选择 IL2CPP 后端；该后端必须支持 `Il2CppLua/4.0.0` 握手。
+Lune 自身的产品版本独立维护，无需与 DLL 版本相同。
 
 Il2CppLua 适合正常使用 IL2CPP 运行时、并保留必要 `il2cpp_*` 导出函数的 Windows x64
 游戏。它不是 Mono 调试器，也不负责解析未加载的 metadata 文件。
@@ -59,20 +60,77 @@ Il2CppLua 适合正常使用 IL2CPP 运行时、并保留必要 `il2cpp_*` 导�
 - 将 Lua 回调投递到 Unity 主线程
 - 对裸对象地址进行基础可读性保护后包装
 
+<a id="architecture"></a>
+
+## 🧱 内部架构与目录
+
+项目把“运行时能力”“Lua 生命周期”“Lua API”“通信”和“Unity 业务适配”分开，依赖方向保持
+从外到内：通信/入口 → Lua 引擎与绑定 → IL2CPP Resolver；Hook 和调度器只通过明确的
+接口协作，不把 Unity 类名塞进通用运行时层。
+
+```text
+Lune
+  │ 命名管道帧
+  ▼
+PipeChannel ──> dll_main 工作线程 ──> LuaEngine ──> lua_binding_* ──> Il2CppResolver
+                                      │                 │
+                                      │                 ├─ lua_value / lua_container
+                                      │                 └─ UnityObjectQuery（Unity 专用适配）
+                                      └─ Il2CppHook ──> hook_stub.asm
+                                         │
+                                         └─ Il2CppScheduler（tick 选择与任务队列）
+```
+
+| 目录/文件 | 单一职责 |
+| --- | --- |
+| `src/dll_main.cpp` | DLL 工作线程、初始化顺序、消息循环和逆序关闭 |
+| `src/pipe_channel.*`、`src/protocol.h` | 命名管道、帧边界、并发发送与版本协议 |
+| `src/il2cpp_resolver.*` | 动态解析 `GameAssembly.dll` 导出和通用反射/运行时调用 |
+| `src/lua_engine.*` | Lua VM 生命周期、互斥访问、代码/文件执行和输出回调 |
+| `src/lua_binding_*.cpp` | 面向 Lua 的 Assembly/Class/Instance/Method/Field API |
+| `src/lua_method_call.cpp` | 方法重载选择、参数存储与运行时调用 |
+| `src/lua_value.cpp`、`src/lua_container.cpp` | 统一类型编组、返回值转换、Array/List/table 操作 |
+| `src/il2cpp_hook.cpp`、`src/hook_stub.asm` | Hook 注册、原生 ABI 调用、回调分发和原函数回退 |
+| `src/il2cpp_scheduler.*` | tick 选择、目标线程识别和 Lua 任务队列 |
+| `src/unity_object_query.*` | `UnityEngine.Object` 查询；不污染通用 Resolver |
+| `lua_src/`、`minhook_src/` | 固定版本的第三方源码，不属于业务层，不应随意改动 |
+
+### 生命周期与并发边界
+
+初始化顺序是 `PipeChannel → Il2CppResolver → LuaEngine → Lua API`。关闭时：
+先禁用 Hook 并等待所有 detour（包括仍在执行的原方法回退）退出，再释放 Lua、IL2CPP
+线程和管道。Lua VM 的所有访问由可重入互斥锁串行化；Hook 注册表、调度队列和管道写入
+各自使用独立锁，Hook 内部固定先取得 Lua 锁，再取得注册表锁。
+
+工作线程只在初始化、执行命令和清理阶段附着到 IL2CPP；等待 Lune 命令时会主动脱离，
+避免游戏退出时运行时等待控制线程。进程终止路径不等待 DLL 内部 I/O，资源由操作系统回收。
+
+Resolver 只提供稳定的 IL2CPP 原语和反射信息，不直接知道 `UnityEngine`；Unity 专用查找
+放在 `unity_object_query.*`。数组目前只实现一维零基 `SZARRAY`，引用数组写入通过运行时
+写屏障完成。
+
+Instance userdata 持有强 GCHandle，Lua GC 时释放，避免跨命令保存对象后失效。句柄固定对象地址，使原生地址接口保持稳定；这不阻止 `UnityEngine.Object.Destroy` 销毁原生实体。类型名由 Resolver 复制、缓存并释放运行时分配。初始化会检查必需的运行时导出，缺失时明确失败；异常文本使用的 object_to_string 为可选导出。
+
+参数评分、普通调用、字段、数组及 Hook 共用类型转换规则：整数拒绝小数；字符串保留嵌入 NUL；接口兼容性使用运行时判断。`get_method` 和自动重载选择会查找父类，构造函数除外。引用类型 `new()` 必须找到匹配构造函数；仅值类型允许无显式构造函数的默认初始化。
+
+调度器一批任务执行期间不会重入排空队列；任务中新提交的回调留待下一次外层 tick。`set_tick` 安装新入口失败时保留旧入口。长日志按不超过 64 KiB 的帧切分，仍受队列总量限制。
+
+版本变化与升级说明见 [4.0.0 重构说明](RELEASE_NOTES_4.0.0.md)。
+
 <a id="quick-start"></a>
 
 ## 🚀 快速开始
 
-将相同版本的 `Il2CppLua.dll` 与 `ilune.exe` 放在同一目录，启动游戏后执行：
+将 `Il2CppLua.dll` 4.0.0 与支持该版本的 `Lune.exe` 放在同一目录，启动游戏后执行：
 
 ```powershell
-ilune.exe -n Game.exe
+Lune.exe -i -n Game.exe
 ```
 
 也可以按 PID 注入，或指定 DLL 与启动脚本：
 
 ```powershell
-ilune.exe -p 1234 -d C:\Tools\Il2CppLua.dll -l C:\Scripts\startup.lua
+Lune.exe -i -p 1234 -d C:\Tools\Il2CppLua.dll -l C:\Scripts\startup.lua
 ```
 
 进入 `ilune >>` 后即可输入 Lua：
@@ -80,17 +138,20 @@ ilune.exe -p 1234 -d C:\Tools\Il2CppLua.dll -l C:\Scripts\startup.lua
 ```lua
 local game = il2cpp.get_assembly("Assembly-CSharp")
 local playerClass = game:get_class("Game", "Player")
-local players = playerClass:find_unity_objects()
-
-if players and players[1] then
-    local player = players[1]
-    player:write_field("health", 999)
-    print(player:read_field("health"))
-    player:call("RefreshStatus")
-end
+il2cpp.schedule(function()
+    local players = playerClass:find_unity_objects()
+    if players and players[1] then
+        local player = players[1]
+        player:write_field("health", 999)
+        print(player:read_field("health"))
+        player:call("RefreshStatus")
+    end
+end)
 ```
 
 示例中的程序集名、命名空间、类名、字段名和方法名必须替换为目标游戏的真实元数据。
+执行 Unity 对象操作前，应确认调度 tick 属于主线程；默认入口不适用时，先使用
+[`il2cpp.set_tick`](#il2cpp-set-tick) 指定游戏的主线程方法。
 
 <a id="api-model"></a>
 
@@ -204,7 +265,7 @@ print(il2cpp.get_status())
 
 ```text
 Initialized: true
-Exports: All 58 functions resolved
+Exports: All 61 functions resolved
 Assemblies: 96
 Images: 96
 Main thread: ready
@@ -377,7 +438,7 @@ local globalType = game:get_class("", "GlobalManager")
 
 #### `assembly:get_classes()`
 
-返回程序集声明的全部 `Class`。目标运行时缺少类枚举导出时会抛出 Lua 错误。
+返回程序集声明的全部 `Class`。类枚举导出属于初始化必需项。
 
 ```lua
 lua.each(assembly:get_classes(), function(cls)
@@ -496,8 +557,8 @@ local named = cls:new("Wukong")
 local positioned = cls:new(10, 20)
 ```
 
-有参数但找不到匹配构造函数时会抛出错误。无参类型没有显式 `.ctor` 时会保留
-`ObjectNew` 创建的默认对象。
+找不到匹配构造函数时会报错。仅值类型允许无参数、无显式 `.ctor` 的默认初始化；
+引用类型若需要有意跳过构造函数，应使用 `alloc()`。
 
 <a id="class-alloc"></a>
 
@@ -606,7 +667,7 @@ print(player:call("GetLevel"))
 player:call("Teleport", 10.0, 20.0, 30.0)
 ```
 
-返回类型为 `void` 的方法不产生 Lua 返回值，因此在 ILune 中不会回显 `nil`。返回类型
+返回类型为 `void` 的方法不产生 Lua 返回值，因此在 Lune 中不会回显 `nil`。返回类型
 是引用类型但实际结果为 null 的方法仍会返回一个 Lua `nil`。
 
 <a id="instance-field"></a>
@@ -745,6 +806,7 @@ local current = manager:get_method("GetCurrent"):call()
 ```
 
 `void` 方法返回 0 个 Lua 值；非 void 方法返回 1 个值，包括用于表示 null 引用的 `nil`。
+普通调用和 Hook 均明确拒绝 `ref/out` 参数及 `ref` 返回值。普通调用可使用已有的闭合泛型方法，不能调用开放泛型定义。
 
 <a id="method-hook"></a>
 
@@ -844,14 +906,18 @@ Field 接口适合需要避免同名字段歧义的场景。`const` 字段不可
 | IL2CPP 类型 | Lua 表示 |
 | --- | --- |
 | `bool` | boolean |
-| 有符号/无符号整数、enum、char | integer |
+| 有符号/无符号整数、char | integer |
 | `float` / `double` | number |
 | `System.String` | string 或 `nil` |
 | class / object / array | Instance 或 `nil` |
+| `IntPtr` / `UIntPtr` | integer |
+| 原生指针 / 函数指针 | lightuserdata |
 | struct | 装箱后的 Instance |
+| enum | 底层整数对应的 Lua integer |
 
 Lua integer 是有符号 64 位；读取大于 `INT64_MAX` 的 `ulong` 时会按原始位模式表现为
-负数。引用参数可以传兼容 Instance 或 `nil`。
+负数。结构体和枚举的临时存储大小来自 IL2CPP 运行时，按实际类型分配存储。
+引用参数可以传兼容 Instance 或 `nil`；一维引用数组的写入会经过 IL2CPP 写屏障。
 
 <a id="hook-threading"></a>
 
@@ -860,9 +926,16 @@ Lua integer 是有符号 64 位；读取大于 `INT64_MAX` 的 `ulong` 时会按
 - Lua VM 由可重入互斥锁串行访问。
 - Hook 回调可能来自任意游戏线程。
 - 进入 Lua 前，Hook 分发器会尝试附加当前 IL2CPP 线程。
-- `il2cpp.schedule` 的任务只在已识别的 Unity 主线程 tick 中执行。
+- `il2cpp.schedule` 的任务只在 tick 首次实际触发的线程中执行；默认 tick 只是候选入口，
+  不能保证每个游戏都运行在 Unity 主线程，必要时应显式调用 `set_tick`。
 - Hook 回调内可以再次调用方法，也可以调用 `original()`。
-- 卸载时先禁用 Hook，并保留可能仍被在途调用引用的 trampoline。
+- `original()` 直接调用 MinHook trampoline，保留原生 `this` 和 `MethodInfo`，无参时沿用原参数，有参时复用统一转换规则；不临时禁用全局 Hook。
+- 值类型 Hook 的 `this` 是供 Lua 查看或操作的装箱快照；对快照的修改不会写回原生 `this`。原方法对原生 `this` 的修改正常保留。
+- `original()` 抛出的原生或托管异常转换为 Lua 错误，不重试；未完成调用没有可复用结果时使用默认返回值并记录错误。
+- 回调报错或返回值不兼容时，如果尚未调用 `original`，调用原方法一次；如果已经调用过，则复用已完成调用的返回值，不重复副作用。
+- Hook 最多接受 64 个声明参数；不支持 `ref/out`、`ref` 返回或泛型方法 Hook。
+- 卸载时先禁用 Hook，并等待完整 detour（包括回退路径中仍在执行的原方法）结束后再释放。
+- 日志通过有界异步队列发送，Hook 和游戏线程不会因管道写入长期阻塞；队列满时会丢弃新日志。
 
 不要在高频 Hook 中执行大量打印、文件 IO 或长时间 Lua 计算。只能在主线程访问的
 Unity 对象，应通过 `il2cpp.schedule` 操作。
@@ -871,33 +944,46 @@ Unity 对象，应通过 `il2cpp.schedule` 操作。
 
 ## 📡 通信与版本校验
 
-ILune 创建命名管道并注入 DLL，DLL 连接后发送：
+Lune 创建命名管道并注入 DLL，DLL 连接后发送：
 
 ```text
-MSG_HELLO: Il2CppLua/3.0.0
+MSG_HELLO: Il2CppLua/4.0.0
 ```
 
-ILune 会将该字符串与自身的 `protocol::VERSION` 精确比较。版本不同会显示 expected 与
+Lune 会将该字符串与 `src/backend_profile.h` 中 `IL2CPP_PROFILE.protocolVersion` 精确比较。版本不同会显示 expected 与
 received，并在等待 READY 或进入 REPL 前终止连接。
 
-产品版本、协议版本和 Windows 文件版本都来自两项目各自的 `src/version.h`。发布时必须
-保证两个文件内容一致。
+`MSG_ERROR` 的负载为 `[1 字节错误类别][4 字节可选行号 little-endian][UTF-8 错误文本]`；`MSG_FILE` 执行中的 Lua 错误可填写行号，普通命令（包括 Lune 的 `-l`）和其他类别使用 `-1`。
+CLI 只显示 `Lua Error`、`Il2Cpp Error`、`CSharp Error` 或 `Lune Error`，不再把 Lua
+内部的 source name（例如 `[string "<string>"]`）暴露给用户。
+
+每个协议帧的负载上限为 1 MiB。Lune 的 `-l` 将 `dofile(绝对路径)` 作为普通命令发送，
+使用 Lua 标准文件加载行为。DLL 另保留 `MSG_FILE` 文件入口，按 UTF-8 路径读取完整文件，
+上限为 4 MiB；此限制不适用于 `dofile` / `loadfile`。
+
+长日志按最多 64 KiB 一帧切分，异步队列总量上限为 4 MiB；队列满时丢弃新日志。
+
+DLL 的产品版本、协议版本和 Windows 文件版本来自 `src/version.h`。发布时同步更新
+Lune 的 `src/backend_profile.h` 中 IL2CPP 后端的显示版本与握手字符串；
+Lune 的 `src/version.h` 只表示控制端自身版本。
 
 <a id="ilune-cli"></a>
+<a id="lune-cli"></a>
 
-## 💻 ILune 命令行
+## 💻 Lune 命令行
 
 ```text
-ilune.exe -n <进程名> [-d <DLL路径>] [-l <Lua脚本>]
-ilune.exe -p <PID>    [-d <DLL路径>] [-l <Lua脚本>]
+Lune.exe -i -n <进程名> [-d <DLL路径>] [-l <Lua脚本>]
+Lune.exe -i -p <PID>    [-d <DLL路径>] [-l <Lua脚本>]
 ```
 
 | 参数 | 说明 | 示例 |
 | --- | --- | --- |
-| `-n`, `--name` | 按进程名注入 | `ilune -n Game.exe` |
-| `-p`, `--pid` | 按 PID 注入 | `ilune -p 1234` |
-| `-d`, `--dll` | 指定 Il2CppLua.dll | `ilune -n Game.exe -d D:\Tools\Il2CppLua.dll` |
-| `-l`, `--lua` | 握手完成后执行脚本 | `ilune -n Game.exe -l D:\Scripts\start.lua` |
+| `-i` | 选择 IL2CPP 后端（必填） | `Lune.exe -i -n Game.exe` |
+| `-n`, `--name` | 按进程名注入 | `Lune.exe -i -n Game.exe` |
+| `-p`, `--pid` | 按 PID 注入 | `Lune.exe -i -p 1234` |
+| `-d`, `--dll` | 指定 Il2CppLua.dll | `Lune.exe -i -n Game.exe -d D:\Tools\Il2CppLua.dll` |
+| `-l`, `--lua` | 握手完成后执行脚本 | `Lune.exe -i -n Game.exe -l D:\Scripts\start.lua` |
 
 REPL 中输入表达式会自动作为 `return <表达式>` 执行，语句则原样执行。输入 `exit` 或
 `quit` 会向 DLL 发送退出消息并关闭控制台。
@@ -906,11 +992,26 @@ REPL 中输入表达式会自动作为 `return <表达式>` 执行，语句则�
 
 ## 🔨 构建
 
-要求：Windows x64、Visual Studio 2022、Windows SDK 10.0、MSVC v145 工具集，以及
+要求：Windows x64、Visual Studio（当前项目工具集 v145）、Windows SDK 10.0、MSVC v145 工具集，以及
 MASM x64 构建支持。
 
-打开 `Il2CppLua.slnx`，选择 `Release | x64` 生成 `Il2CppLua.dll`。ILune 也应使用
-`Release | x64`。正式发布时将相同 v3.0.0 的 DLL 与 EXE 放在一起。
+打开 `Il2CppLua.slnx`，选择 `Release | x64` 生成 `Il2CppLua.dll`。Lune 也应使用
+`Release | x64`。正式发布时配套提供支持 `Il2CppLua/4.0.0` 的 Lune 控制端。
+
+源码中的 `src/hook_stub.asm` 必须由 MASM 编译；如果只使用命令行编译器检查 C++，仍需单独
+编译该文件，不能把 Hook 跳板替换成普通 C++ 函数。`lua_src/` 和 `minhook_src/` 是项目
+随附的第三方实现，业务修改应集中在 `src/`。
+
+<a id="verification"></a>
+
+## 验证与测试脚本
+
+4.0.0 修复 `lua.each` 非数组键回调参数错误，以及无参、非 void 方法返回值丢失后，
+维护者已确认功能测试通过。发布前的源码与文档整理不等同于重新执行测试。
+
+[scripts/longyin_api_test.lua](scripts/longyin_api_test.lua) 是针对《龙胤立志传》的手动功能测试脚本，
+依赖该游戏的类型和场景，不能直接用于其他游戏。使用前阅读脚本头部说明；其中包含对象创建、
+字段写入、Hook 和异步调度，适合独立测试会话。它不验证 DLL 卸载并发、通信边界或原生资源泄漏。
 
 <a id="limitations"></a>
 
@@ -922,8 +1023,14 @@ MASM x64 构建支持。
 - 类的方法与字段枚举当前各自最多保留 1024 项。
 - `get_class` 全程序集搜索遇到同名类型时返回第一个结果。
 - `get_method(name)` 遇到重载时返回第一个结果，应传参数类型进行精确选择。
-- 泛型共享代码可能使多个 MethodInfo 指向同一个原生 methodPointer。
-- Hook 中的 `ref/out` 参数目前不能通过修改 Lua 参数写回调用方。
+- 泛型方法与泛型实例化方法不提供 Hook，避免共享代码和特殊 ABI 导致错误拦截；闭合泛型的普通调用仍可用。
+- 只支持一维零基 `SZARRAY`；多维数组的 bounds 和索引未实现。
+- 普通调用和 Hook 都拒绝 `ref/out` 参数及 `ref` 返回值。
+- 引用数组使用 `il2cpp_gc_wbarrier_set_field`；含托管引用的 struct 数组元素暂不支持直接写入。
+- 默认调度 tick 不能证明线程一定是 Unity 主线程；需要可靠线程语义时必须使用 `set_tick`。
+- Hook 只接受标准 IL2CPP Windows x64 调用约定，最多 64 个声明参数。
+- Hook 回调线程会附加到 IL2CPP，当前策略保持这些线程的运行时附加状态到进程结束，避免
+  在未知回调生命周期中错误 detach。
 - 任意裸地址即使当前可读，也可能在之后因 GC、对象销毁或内存复用而失效。
 
 <a id="license"></a>

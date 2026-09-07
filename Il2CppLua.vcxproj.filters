@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <Filter Include="lua_src">
@@ -144,6 +144,9 @@
     <ClCompile Include="src\il2cpp_scheduler.cpp">
       <Filter>cpp_src</Filter>
     </ClCompile>
+    <ClCompile Include="src\unity_object_query.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
     <ClCompile Include="src\lua_binding_assembly.cpp">
       <Filter>cpp_src</Filter>
     </ClCompile>
@@ -178,6 +181,9 @@
       <Filter>cpp_src</Filter>
     </ClCompile>
     <ClCompile Include="src\lua_value.cpp">
+      <Filter>cpp_src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\lua_method_call.cpp">
       <Filter>cpp_src</Filter>
     </ClCompile>
   </ItemGroup>
@@ -294,6 +300,9 @@
       <Filter>h_src</Filter>
     </ClInclude>
     <ClInclude Include="src\il2cpp_scheduler.h">
+      <Filter>h_src</Filter>
+    </ClInclude>
+    <ClInclude Include="src\unity_object_query.h">
       <Filter>h_src</Filter>
     </ClInclude>
     <ClInclude Include="src\lua_binding_internal.h">

@@ -1,19 +1,12 @@
 /**
- * ============================================================
  * lua_container.cpp — 托管 Array、List<T> 与 Lua table 访问
- * ============================================================
  * Array 根据元素类型直接读写连续内存；List<T> 通过 Count、get_Item 和
  * set_Item 方法访问，避免依赖不同 Unity 版本的私有字段布局。Lua table
  * 遍历则完全使用 Lua C API，与 IL2CPP 容器逻辑保持隔离。
- * ============================================================
  */
 #include "lua_binding_internal.h"
-#include <vector>
-
-// ============================================================
+#include <cstring>
 // 数组辅助函数实现
-// ============================================================
-
 bool LuaBridge_IsArray(Il2CppObject* obj)
 {
     if (obj == nullptr) return false;
@@ -28,11 +21,10 @@ bool LuaBridge_IsArray(Il2CppObject* obj)
     const Il2CppType* type = resolver.GetClassType(klass);
     if (type == nullptr) return false;
 
-    // 检查类型枚举是否为数组类型
-    // SZARRAY = 一维零基数组 ARRAY = 多维数组
+    // 这里的内存访问只实现了一维零基数组。多维数组的 bounds 和索引
+    // 规则不同，不能静默地套用同一套偏移计算。
     int32_t typeEnum = resolver.GetTypeEnum(type);
-    return typeEnum == Il2CppTypeEnum::TYPE_SZARRAY
-        || typeEnum == Il2CppTypeEnum::TYPE_ARRAY;
+    return typeEnum == Il2CppTypeEnum::TYPE_SZARRAY;
 }
 
 uint64_t LuaBridge_GetArrayLength(Il2CppObject* arr)
@@ -41,14 +33,10 @@ uint64_t LuaBridge_GetArrayLength(Il2CppObject* arr)
     auto& resolver = Il2CppResolver::Instance();
     return resolver.ArrayLength(reinterpret_cast<Il2CppArray*>(arr));
 }
-
-// ============================================================
 // 数组元素类型与大小辅助
-// ============================================================
-
-// 获取数组元素类与元素大小
-// 引用类型元素固定为指针大小 值类型元素通过 class_value_size 获取实际大小
-// 旧版 Unity 缺少导出时回退按引用类型指针处理（保持旧行为）
+// 获取数组元素类与元素大小。
+// 引用类型元素固定为指针大小，值类型元素必须从运行时取得真实大小；
+// 不再对未知类型猜测布局。
 static bool LuaBridge_GetArrayElementInfo(Il2CppObject* arr, Il2CppClass*& outElemClass, int32_t& outElemSize)
 {
     if (arr == nullptr) return false;
@@ -58,66 +46,35 @@ static bool LuaBridge_GetArrayElementInfo(Il2CppObject* arr, Il2CppClass*& outEl
     // 从对象头读取数组类
     Il2CppClass* arrayClass = READ_OFFSET(arr, 0, Il2CppClass*)[0];
     if (arrayClass == nullptr) return false;
+    const Il2CppType* arrayType = resolver.GetClassType(arrayClass);
+    if (arrayType == nullptr
+        || resolver.GetTypeEnum(arrayType) != Il2CppTypeEnum::TYPE_SZARRAY)
+        return false;
 
-    // 通过官方 API 获取元素类（仅数组类有效）
+    // 通过官方 API 获取元素类。元素类型未知时不能猜测为指针，否则会
+    // 把值类型数组按引用数组读写，造成数据损坏。
     outElemClass = resolver.GetElementClass(arrayClass);
-    if (outElemClass == nullptr)
-    {
-        // 无法确定元素类型 回退为指针大小（按引用类型数组处理）
-        outElemSize = static_cast<int32_t>(sizeof(void*));
-        return true;
-    }
+    if (outElemClass == nullptr) return false;
 
-    // 元素类型枚举
-    const Il2CppType* elemType = resolver.GetClassType(outElemClass);
-    int32_t typeEnum = elemType ? resolver.GetTypeEnum(elemType) : 0;
+    const auto* type = resolver.GetClassType(outElemClass);
+    outElemSize = static_cast<int32_t>(LuaBridge_GetValueStorageSize(type));
+    return outElemSize > 0;
+}
 
-    // 引用类型（含多维数组）元素固定为指针大小
-    if (LuaBridge_IsRefType(typeEnum) || typeEnum == Il2CppTypeEnum::TYPE_ARRAY)
-    {
-        outElemSize = static_cast<int32_t>(sizeof(void*));
-        return true;
-    }
+// 计算一维数组元素地址，同时检查乘法和加法溢出。
+static uint8_t* LuaBridge_GetArrayElementPointer(
+    Il2CppArray* arr, uint64_t index, int32_t elemSize)
+{
+    if (arr == nullptr || elemSize <= 0) return nullptr;
+    const uint64_t maxSize = static_cast<uint64_t>(SIZE_MAX);
+    if (index > (maxSize - ARRAY_DATA_OFFSET) / static_cast<uint64_t>(elemSize))
+        return nullptr;
 
-    // 基本类型按固定大小映射
-    switch (typeEnum)
-    {
-    case Il2CppTypeEnum::TYPE_BOOLEAN:
-    case Il2CppTypeEnum::TYPE_I1:
-    case Il2CppTypeEnum::TYPE_U1:
-        outElemSize = 1;
-        return true;
-    case Il2CppTypeEnum::TYPE_CHAR:
-    case Il2CppTypeEnum::TYPE_I2:
-    case Il2CppTypeEnum::TYPE_U2:
-        outElemSize = 2;
-        return true;
-    case Il2CppTypeEnum::TYPE_I4:
-    case Il2CppTypeEnum::TYPE_U4:
-    case Il2CppTypeEnum::TYPE_R4:
-        outElemSize = 4;
-        return true;
-    case Il2CppTypeEnum::TYPE_I8:
-    case Il2CppTypeEnum::TYPE_U8:
-    case Il2CppTypeEnum::TYPE_R8:
-    case Il2CppTypeEnum::TYPE_I:
-    case Il2CppTypeEnum::TYPE_U:
-        outElemSize = 8;
-        return true;
-    case Il2CppTypeEnum::TYPE_VALUETYPE:
-    {
-        // 结构体元素：通过 value_size 获取实际大小
-        uint32_t align = 0;
-        int32_t size = resolver.ClassValueSize(outElemClass, &align);
-        if (size <= 0) return false;
-        outElemSize = size;
-        return true;
-    }
-    default:
-        // 未知类型 回退为指针大小
-        outElemSize = static_cast<int32_t>(sizeof(void*));
-        return true;
-    }
+    const size_t offset = static_cast<size_t>(ARRAY_DATA_OFFSET
+        + index * static_cast<uint64_t>(elemSize));
+    const uintptr_t base = reinterpret_cast<uintptr_t>(arr);
+    if (offset > UINTPTR_MAX - base) return nullptr;
+    return reinterpret_cast<uint8_t*>(base + offset);
 }
 
 // 将数组第 index 个元素转换为 Lua 值压栈
@@ -129,86 +86,14 @@ bool LuaBridge_PushArrayElement(lua_State* L, Il2CppObject* arr, int64_t index)
     if (!LuaBridge_GetArrayElementInfo(arr, elemClass, elemSize)) return false;
 
     auto& resolver = Il2CppResolver::Instance();
-    uint8_t* elemPtr = reinterpret_cast<uint8_t*>(arr) + ARRAY_DATA_OFFSET + index * elemSize;
-
-    // 元素类未知 按引用类型指针处理（保持旧行为）
-    if (elemClass == nullptr)
-    {
-        Il2CppObject* elem = *reinterpret_cast<Il2CppObject**>(elemPtr);
-        LuaBridge_PushInstance(L, elem, nullptr);
-        return true;
-    }
+    const uint64_t length = resolver.ArrayLength(reinterpret_cast<Il2CppArray*>(arr));
+    if (index < 0 || static_cast<uint64_t>(index) >= length) return false;
+    uint8_t* elemPtr = LuaBridge_GetArrayElementPointer(
+        reinterpret_cast<Il2CppArray*>(arr), static_cast<uint64_t>(index), elemSize);
+    if (elemPtr == nullptr) return false;
 
     const Il2CppType* elemType = resolver.GetClassType(elemClass);
-    int32_t typeEnum = elemType ? resolver.GetTypeEnum(elemType) : 0;
-
-    switch (typeEnum)
-    {
-    case Il2CppTypeEnum::TYPE_BOOLEAN:
-        lua_pushboolean(L, *reinterpret_cast<bool*>(elemPtr));
-        return true;
-    case Il2CppTypeEnum::TYPE_CHAR:
-    case Il2CppTypeEnum::TYPE_U2:
-        lua_pushinteger(L, *reinterpret_cast<uint16_t*>(elemPtr));
-        return true;
-    case Il2CppTypeEnum::TYPE_I1:
-        lua_pushinteger(L, *reinterpret_cast<int8_t*>(elemPtr));
-        return true;
-    case Il2CppTypeEnum::TYPE_U1:
-        lua_pushinteger(L, *reinterpret_cast<uint8_t*>(elemPtr));
-        return true;
-    case Il2CppTypeEnum::TYPE_I2:
-        lua_pushinteger(L, *reinterpret_cast<int16_t*>(elemPtr));
-        return true;
-    case Il2CppTypeEnum::TYPE_I4:
-        lua_pushinteger(L, *reinterpret_cast<int32_t*>(elemPtr));
-        return true;
-    case Il2CppTypeEnum::TYPE_U4:
-        lua_pushinteger(L, *reinterpret_cast<uint32_t*>(elemPtr));
-        return true;
-    case Il2CppTypeEnum::TYPE_I8:
-        lua_pushinteger(L, *reinterpret_cast<int64_t*>(elemPtr));
-        return true;
-    case Il2CppTypeEnum::TYPE_U8:
-        // lua_Integer 为有符号 64 位 超过 INT64_MAX 的值会回绕
-        lua_pushinteger(L, static_cast<lua_Integer>(*reinterpret_cast<uint64_t*>(elemPtr)));
-        return true;
-    case Il2CppTypeEnum::TYPE_R4:
-        lua_pushnumber(L, *reinterpret_cast<float*>(elemPtr));
-        return true;
-    case Il2CppTypeEnum::TYPE_R8:
-        lua_pushnumber(L, *reinterpret_cast<double*>(elemPtr));
-        return true;
-    case Il2CppTypeEnum::TYPE_I:
-    case Il2CppTypeEnum::TYPE_U:
-        lua_pushinteger(L, static_cast<lua_Integer>(*reinterpret_cast<intptr_t*>(elemPtr)));
-        return true;
-    case Il2CppTypeEnum::TYPE_STRING:
-    {
-        Il2CppString* str = *reinterpret_cast<Il2CppString**>(elemPtr);
-        if (str != nullptr) LuaBridge_PushString(L, str);
-        else lua_pushnil(L);
-        return true;
-    }
-    case Il2CppTypeEnum::TYPE_CLASS:
-    case Il2CppTypeEnum::TYPE_OBJECT:
-    case Il2CppTypeEnum::TYPE_SZARRAY:
-    case Il2CppTypeEnum::TYPE_ARRAY:
-    {
-        Il2CppObject* elem = *reinterpret_cast<Il2CppObject**>(elemPtr);
-        LuaBridge_PushInstance(L, elem, elemClass);
-        return true;
-    }
-    case Il2CppTypeEnum::TYPE_VALUETYPE:
-    {
-        // 结构体元素：装箱后包装为 Instance
-        Il2CppObject* boxed = resolver.Box(elemClass, elemPtr);
-        LuaBridge_PushInstance(L, boxed, elemClass);
-        return true;
-    }
-    default:
-        return false;
-    }
+    return LuaBridge_PushFieldValue(L, elemType, elemPtr) == 1;
 }
 
 // 将 Lua 栈上 valueIdx 位置的值写入数组第 index 个元素
@@ -220,118 +105,32 @@ bool LuaBridge_SetArrayElement(lua_State* L, Il2CppObject* arr, int64_t index, i
     if (!LuaBridge_GetArrayElementInfo(arr, elemClass, elemSize)) return false;
 
     auto& resolver = Il2CppResolver::Instance();
-    uint8_t* elemPtr = reinterpret_cast<uint8_t*>(arr) + ARRAY_DATA_OFFSET + index * elemSize;
-
-    // 元素类未知 按引用类型指针处理（保持旧行为）
-    if (elemClass == nullptr)
-    {
-        if (lua_isnil(L, valueIdx)) *reinterpret_cast<Il2CppObject**>(elemPtr) = nullptr;
-        else
-        {
-            LuaInstanceUD* valUD = LuaBridge_CheckInstance(L, valueIdx);
-            if (valUD == nullptr) return false;
-            *reinterpret_cast<Il2CppObject**>(elemPtr) = valUD->obj;
-        }
-        return true;
-    }
+    const uint64_t length = resolver.ArrayLength(reinterpret_cast<Il2CppArray*>(arr));
+    if (index < 0 || static_cast<uint64_t>(index) >= length) return false;
+    uint8_t* elemPtr = LuaBridge_GetArrayElementPointer(
+        reinterpret_cast<Il2CppArray*>(arr), static_cast<uint64_t>(index), elemSize);
+    if (elemPtr == nullptr) return false;
 
     const Il2CppType* elemType = resolver.GetClassType(elemClass);
-    int32_t typeEnum = elemType ? resolver.GetTypeEnum(elemType) : 0;
+    if (elemType == nullptr) return false;
 
-    switch (typeEnum)
+    // 含引用的结构体需要逐字段写屏障；当前 API 明确拒绝裸 memcpy。
+    if (resolver.IsValueType(elemClass) && resolver.HasReferences(elemClass)) return false;
+    valueIdx = lua_absindex(L, valueIdx);
+    void* storage = LuaBridge_NewBuffer(L, static_cast<size_t>(elemSize));
+    void* value = nullptr;
+    bool ok = LuaBridge_MarshalArg(L, valueIdx, elemType, storage, value, elemSize);
+    if (ok)
     {
-    case Il2CppTypeEnum::TYPE_BOOLEAN:
-        *reinterpret_cast<bool*>(elemPtr) = lua_toboolean(L, valueIdx) != 0;
-        return true;
-    case Il2CppTypeEnum::TYPE_CHAR:
-    case Il2CppTypeEnum::TYPE_U2:
-        *reinterpret_cast<uint16_t*>(elemPtr) = static_cast<uint16_t>(lua_tointeger(L, valueIdx));
-        return true;
-    case Il2CppTypeEnum::TYPE_I1:
-        *reinterpret_cast<int8_t*>(elemPtr) = static_cast<int8_t>(lua_tointeger(L, valueIdx));
-        return true;
-    case Il2CppTypeEnum::TYPE_U1:
-        *reinterpret_cast<uint8_t*>(elemPtr) = static_cast<uint8_t>(lua_tointeger(L, valueIdx));
-        return true;
-    case Il2CppTypeEnum::TYPE_I2:
-        *reinterpret_cast<int16_t*>(elemPtr) = static_cast<int16_t>(lua_tointeger(L, valueIdx));
-        return true;
-    case Il2CppTypeEnum::TYPE_I4:
-        *reinterpret_cast<int32_t*>(elemPtr) = static_cast<int32_t>(lua_tointeger(L, valueIdx));
-        return true;
-    case Il2CppTypeEnum::TYPE_U4:
-        *reinterpret_cast<uint32_t*>(elemPtr) = static_cast<uint32_t>(lua_tointeger(L, valueIdx));
-        return true;
-    case Il2CppTypeEnum::TYPE_I8:
-        *reinterpret_cast<int64_t*>(elemPtr) = static_cast<int64_t>(lua_tointeger(L, valueIdx));
-        return true;
-    case Il2CppTypeEnum::TYPE_U8:
-        *reinterpret_cast<uint64_t*>(elemPtr) = static_cast<uint64_t>(lua_tointeger(L, valueIdx));
-        return true;
-    case Il2CppTypeEnum::TYPE_R4:
-        *reinterpret_cast<float*>(elemPtr) = static_cast<float>(lua_tonumber(L, valueIdx));
-        return true;
-    case Il2CppTypeEnum::TYPE_R8:
-        *reinterpret_cast<double*>(elemPtr) = lua_tonumber(L, valueIdx);
-        return true;
-    case Il2CppTypeEnum::TYPE_I:
-    case Il2CppTypeEnum::TYPE_U:
-        *reinterpret_cast<intptr_t*>(elemPtr) = static_cast<intptr_t>(lua_tointeger(L, valueIdx));
-        return true;
-    case Il2CppTypeEnum::TYPE_STRING:
-    {
-        if (lua_isnil(L, valueIdx)) *reinterpret_cast<Il2CppString**>(elemPtr) = nullptr;
-        else
-        {
-            const char* str = lua_tostring(L, valueIdx);
-            *reinterpret_cast<Il2CppString**>(elemPtr) = resolver.StringNew(str ? str : "");
-        }
-        return true;
+        if (LuaBridge_IsRefType(elemType))
+            ok = resolver.ArraySetReference(reinterpret_cast<Il2CppArray*>(arr), index, static_cast<Il2CppObject*>(value));
+        else if (value != nullptr) memcpy(elemPtr, value, static_cast<size_t>(elemSize));
+        else ok = false;
     }
-    case Il2CppTypeEnum::TYPE_CLASS:
-    case Il2CppTypeEnum::TYPE_OBJECT:
-    case Il2CppTypeEnum::TYPE_SZARRAY:
-    case Il2CppTypeEnum::TYPE_ARRAY:
-    {
-        if (lua_isnil(L, valueIdx)) *reinterpret_cast<Il2CppObject**>(elemPtr) = nullptr;
-        else
-        {
-            LuaInstanceUD* valUD = LuaBridge_CheckInstance(L, valueIdx);
-            if (valUD == nullptr) return false;
-            *reinterpret_cast<Il2CppObject**>(elemPtr) = valUD->obj;
-        }
-        return true;
-    }
-    case Il2CppTypeEnum::TYPE_VALUETYPE:
-    {
-        if (lua_islightuserdata(L, valueIdx))
-        {
-            // 直接拷贝用户提供的原始结构体内存
-            memcpy(elemPtr, lua_touserdata(L, valueIdx), elemSize);
-        }
-        else if (lua_isnil(L, valueIdx))
-        {
-            memset(elemPtr, 0, elemSize);
-        }
-        else
-        {
-            // 已装箱的值类型 拆箱后拷贝
-            LuaInstanceUD* valUD = LuaBridge_CheckInstance(L, valueIdx);
-            if (valUD == nullptr || valUD->obj == nullptr) return false;
-            void* unboxed = resolver.Unbox(valUD->obj);
-            if (unboxed == nullptr) return false;
-            memcpy(elemPtr, unboxed, elemSize);
-        }
-        return true;
-    }
-    default:
-        return false;
-    }
+    lua_pop(L, 1);
+    return ok;
 }
-
-// ============================================================
 // 通用遍历辅助（数组 / List<T> / Lua 表）
-// ============================================================
 // 供 obj:each 与 Lua table 辅助工具共用
 // 回调签名统一为 function(value, index) 索引从 1 开始
 
@@ -382,6 +181,25 @@ int64_t LuaBridge_GetListCount(Il2CppObject* list, Il2CppClass* klass)
     }
 }
 
+static int PushListElement(lua_State* L, Il2CppObject* list, const Il2CppMethod* method, int64_t index)
+{
+    auto& resolver = Il2CppResolver::Instance();
+    int32_t managedIndex = static_cast<int32_t>(index);
+    void* args[] = { &managedIndex };
+    Il2CppException* exception = nullptr;
+    auto* result = resolver.RuntimeInvoke(method, list, args, &exception);
+    if (exception != nullptr)
+    {
+        return LuaEngine::RaiseManagedException(
+            L,
+            exception,
+            "List get_Item threw a CSharp exception (managed exception text unavailable)");
+    }
+    if (LuaBridge_PushReturnValue(L, result, resolver.GetMethodReturnType(method)) != 1)
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "unsupported List element return type");
+    return 1;
+}
+
 // 遍历 IL2CPP 数组: 对每个元素调用 fn(value, index)
 void LuaBridge_EachArray(lua_State* L, Il2CppObject* arr, int fnIdx, int64_t& outCount)
 {
@@ -393,7 +211,7 @@ void LuaBridge_EachArray(lua_State* L, Il2CppObject* arr, int fnIdx, int64_t& ou
         // 读取数组元素压栈（与 obj[i] 使用同一套编组）
         if (!LuaBridge_PushArrayElement(L, arr, static_cast<int64_t>(i)))
         {
-            luaL_error(L, "unsupported array element type at index %llu", static_cast<unsigned long long>(i));
+            LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "unsupported array element type at index %I", static_cast<lua_Integer>(i + 1));
             return;
         }
 
@@ -409,7 +227,7 @@ void LuaBridge_EachArray(lua_State* L, Il2CppObject* arr, int fnIdx, int64_t& ou
             snprintf(errBuf, sizeof(errBuf), "each callback error: %s", err ? err : "(non-string error)");
             lua_pop(L, 1);      // 错误
             lua_pop(L, 1);      // value
-            luaL_error(L, "%s", errBuf);
+            LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "%s", errBuf);
             return;
         }
         lua_pop(L, 1);          // value
@@ -423,42 +241,23 @@ void LuaBridge_EachList(lua_State* L, Il2CppObject* list, Il2CppClass* klass, in
     if (klass == nullptr) klass = READ_OFFSET(list, 0, Il2CppClass*)[0];
     if (klass == nullptr)
     {
-        luaL_error(L, "cannot determine class for List");
-        return;
-    }
-
-    const Il2CppMethod* getCount = resolver.GetMethod(klass, "get_Count");
-    const Il2CppMethod* getItem = resolver.GetMethod(klass, "get_Item");
-    if (getCount == nullptr || getItem == nullptr)
-    {
-        luaL_error(L, "List get_Count/get_Item not found");
+        LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "cannot determine class for List");
         return;
     }
 
     int64_t count = LuaBridge_GetListCount(list, klass);
     if (count < 0)
     {
-        luaL_error(L, "failed to get List count");
+        LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "failed to get List count");
         return;
     }
+    const auto* getItem = resolver.GetMethod(klass, "get_Item");
+    if (getItem == nullptr) { LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "List get_Item not found"); return; }
     outCount = count;
 
     for (int64_t i = 0; i < count; ++i)
     {
-        // 调用 get_Item(i) 取出元素
-        int32_t idx = static_cast<int32_t>(i);
-        void* args[1] = { &idx };
-        Il2CppException* exc = nullptr;
-        Il2CppObject* elem = resolver.RuntimeInvoke(getItem, list, args, &exc);
-        if (exc != nullptr)
-        {
-            luaL_error(L, "List get_Item(%lld) threw a C# exception", static_cast<long long>(i));
-            return;
-        }
-
-        // 元素转 Lua 值（与 mth:call 使用同一套返回值转换）
-        const Il2CppType* retType = resolver.GetMethodReturnType(getItem);
-        LuaBridge_PushReturnValue(L, elem, retType);
+        PushListElement(L, list, getItem, i);
 
         // 调用 fn(value, index)
         lua_pushvalue(L, fnIdx);
@@ -472,7 +271,7 @@ void LuaBridge_EachList(lua_State* L, Il2CppObject* list, Il2CppClass* klass, in
             snprintf(errBuf, sizeof(errBuf), "each callback error: %s", err ? err : "(non-string error)");
             lua_pop(L, 1);      // 错误
             lua_pop(L, 1);      // value
-            luaL_error(L, "%s", errBuf);
+            LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "%s", errBuf);
             return;
         }
         lua_pop(L, 1);          // value
@@ -483,6 +282,10 @@ void LuaBridge_EachList(lua_State* L, Il2CppObject* list, Il2CppClass* klass, in
 // 回调 fn(value, index_or_key)
 int LuaBridge_EachTable(lua_State* L, int tblIdx, int fnIdx)
 {
+    // 回调执行会改变 Lua 栈，先把两个参数固定为绝对索引，避免负索引
+    // 在压入 value、函数和错误对象后指向错误的位置。
+    tblIdx = lua_absindex(L, tblIdx);
+    fnIdx = lua_absindex(L, fnIdx);
     luaL_checktype(L, tblIdx, LUA_TTABLE);
     luaL_checktype(L, fnIdx, LUA_TFUNCTION);
 
@@ -509,7 +312,7 @@ int LuaBridge_EachTable(lua_State* L, int tblIdx, int fnIdx)
             snprintf(errBuf, sizeof(errBuf), "each callback error: %s", err ? err : "(non-string error)");
             lua_pop(L, 1);      // 错误
             lua_pop(L, 1);      // value
-            return luaL_error(L, "%s", errBuf);
+            return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "%s", errBuf);
         }
         lua_pop(L, 1);          // value
     }
@@ -529,7 +332,8 @@ int LuaBridge_EachTable(lua_State* L, int tblIdx, int fnIdx)
         if (!skip)
         {
             lua_pushvalue(L, fnIdx);
-            lua_pushvalue(L, -3);   // value
+            // ... key value fn → ... key value fn value key
+            lua_pushvalue(L, -2);   // value
             lua_pushvalue(L, -4);   // key
             if (lua_pcall(L, 2, 0, 0) != LUA_OK)
             {
@@ -539,7 +343,7 @@ int LuaBridge_EachTable(lua_State* L, int tblIdx, int fnIdx)
                 lua_pop(L, 1);      // 错误
                 lua_pop(L, 1);      // value
                 lua_pop(L, 1);      // key
-                return luaL_error(L, "%s", errBuf);
+                return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "%s", errBuf);
             }
         }
 
@@ -560,4 +364,32 @@ int64_t LuaBridge_GetTableCount(lua_State* L, int tblIdx)
         lua_pop(L, 1);
     }
     return count;
+}
+
+int LuaBridge_GetListElement(lua_State* L, Il2CppObject* list, Il2CppClass* klass, int64_t index)
+{
+    auto& resolver = Il2CppResolver::Instance();
+    const int64_t count = LuaBridge_GetListCount(list, klass);
+    if (count < 0) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "failed to get List count");
+    if (index < 0 || index >= count) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "List index out of bounds");
+    const auto* method = resolver.GetMethod(klass, "get_Item");
+    if (method == nullptr) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "List get_Item not found");
+    return PushListElement(L, list, method, index);
+}
+
+int LuaBridge_SetListElement(lua_State* L, Il2CppObject* list, Il2CppClass* klass, int64_t index, int valueIndex)
+{
+    auto& resolver = Il2CppResolver::Instance();
+    const int64_t count = LuaBridge_GetListCount(list, klass);
+    if (count < 0) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "failed to get List count");
+    if (index < 0 || index >= count) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "List index out of bounds");
+    const auto* method = resolver.GetMethod(klass, "set_Item");
+    if (method == nullptr) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "List set_Item not found");
+    valueIndex = lua_absindex(L, valueIndex);
+    const int top = lua_gettop(L);
+    lua_pushinteger(L, static_cast<lua_Integer>(index));
+    lua_pushvalue(L, valueIndex);
+    LuaBridge_InvokeMethod(L, method, list, top + 1);
+    lua_settop(L, top);
+    return 0;
 }

@@ -1,18 +1,11 @@
 /**
- * ============================================================
  * lua_binding_field.cpp — Field userdata 绑定
- * ============================================================
  * 同一个 Field userdata 同时支持静态和实例字段，通过字段 flags 决定参数
  * 形式。读写前验证实例与声明类兼容性，并统一复用 Lua/C# 值编组规则。
- * ============================================================
  */
 #include "lua_binding_internal.h"
 #include <cstdio>
-
-// ============================================================
 // Field 元表方法
-// ============================================================
-
 // fld:get_name() → string
 static int Field_GetName(lua_State* L)
 {
@@ -22,7 +15,6 @@ static int Field_GetName(lua_State* L)
     lua_pushstring(L, name ? name : "");
     return 1;
 }
-
 // fld:get_class() → Class | nil
 static int Field_GetClass(lua_State* L)
 {
@@ -110,151 +102,71 @@ static int Field_Read(lua_State* L)
     LuaFieldUD* ud = static_cast<LuaFieldUD*>(luaL_checkudata(L, 1, LuaBridgeMT::FIELD));
     auto& resolver = Il2CppResolver::Instance();
 
-    // 按字段类型动态分配缓冲区 避免大结构体越界
-    const Il2CppType* fieldType = resolver.GetFieldType(ud->field);
-    int32_t typeEnum = resolver.GetTypeEnum(fieldType);
-    std::vector<uint8_t> fieldStorage(LuaBridge_GetFieldValueSize(fieldType, typeEnum), 0);
-    uint8_t* buffer = fieldStorage.data();
-
     if (resolver.IsStaticField(ud->field))
     {
-        if (lua_gettop(L) != 1) return luaL_error(L, "static field read takes no arguments");
-        resolver.ReadStaticField(ud->field, buffer);
+        if (lua_gettop(L) != 1) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "static field read takes no arguments");
+        return LuaBridge_ReadField(L, nullptr, ud->field);
     }
-    else
-    {
-        if (lua_gettop(L) != 2) return luaL_error(L, "instance field read requires an Instance");
-        LuaInstanceUD* instUD = LuaBridge_CheckInstance(L, 2);
-        if (instUD == nullptr) return luaL_error(L, "instance field read requires an Instance");
-        Il2CppClass* declaringClass = resolver.GetFieldClass(ud->field);
-        if (declaringClass == nullptr) declaringClass = ud->klass;
-        Il2CppClass* instanceClass = instUD->klass;
-        if (instanceClass == nullptr && instUD->obj != nullptr)
-            instanceClass = READ_OFFSET(instUD->obj, 0, Il2CppClass*)[0];
-        if (!resolver.IsAssignableFrom(declaringClass, instanceClass))
-            return luaL_error(L, "instance type is not compatible with field declaring class");
-        resolver.ReadField(instUD->obj, ud->field, buffer);
-    }
+    if (lua_gettop(L) != 2) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "instance field read requires an Instance");
+    auto* instance = LuaBridge_CheckInstance(L, 2);
+    if (instance == nullptr || !resolver.IsAssignableFrom(resolver.GetFieldClass(ud->field), instance->klass))
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "instance type is not compatible with field declaring class");
+    return LuaBridge_ReadField(L, instance->obj, ud->field);
+}
 
-    switch (typeEnum)
-    {
-    case Il2CppTypeEnum::TYPE_BOOLEAN:
-        lua_pushboolean(L, *reinterpret_cast<bool*>(buffer));
-        break;
-    case Il2CppTypeEnum::TYPE_CHAR:
-        lua_pushinteger(L, *reinterpret_cast<uint16_t*>(buffer));
-        break;
-    case Il2CppTypeEnum::TYPE_I1:
-        lua_pushinteger(L, *reinterpret_cast<int8_t*>(buffer));
-        break;
-    case Il2CppTypeEnum::TYPE_I2:
-        lua_pushinteger(L, *reinterpret_cast<int16_t*>(buffer));
-        break;
-    case Il2CppTypeEnum::TYPE_U1:
-        lua_pushinteger(L, *reinterpret_cast<uint8_t*>(buffer));
-        break;
-    case Il2CppTypeEnum::TYPE_U2:
-        lua_pushinteger(L, *reinterpret_cast<uint16_t*>(buffer));
-        break;
-    case Il2CppTypeEnum::TYPE_U4:
-        lua_pushinteger(L, *reinterpret_cast<uint32_t*>(buffer));
-        break;
-    case Il2CppTypeEnum::TYPE_U8:
-        // lua_Integer 为有符号 64 位 超过 INT64_MAX 的值会回绕
-        lua_pushinteger(L, static_cast<lua_Integer>(*reinterpret_cast<uint64_t*>(buffer)));
-        break;
-    case Il2CppTypeEnum::TYPE_I:
-    case Il2CppTypeEnum::TYPE_U:
-        lua_pushinteger(L, static_cast<lua_Integer>(*reinterpret_cast<intptr_t*>(buffer)));
-        break;
-    case Il2CppTypeEnum::TYPE_I4:
-        lua_pushinteger(L, *reinterpret_cast<int32_t*>(buffer));
-        break;
-    case Il2CppTypeEnum::TYPE_I8:
-        lua_pushinteger(L, *reinterpret_cast<int64_t*>(buffer));
-        break;
-    case Il2CppTypeEnum::TYPE_R4:
-        lua_pushnumber(L, *reinterpret_cast<float*>(buffer));
-        break;
-    case Il2CppTypeEnum::TYPE_R8:
-        lua_pushnumber(L, *reinterpret_cast<double*>(buffer));
-        break;
-    case Il2CppTypeEnum::TYPE_STRING:
-    {
-        Il2CppString* str = *reinterpret_cast<Il2CppString**>(buffer);
-        if (str != nullptr) LuaBridge_PushString(L, str);
-        else lua_pushnil(L);
-        break;
-    }
-    case Il2CppTypeEnum::TYPE_VALUETYPE:
-    {
-        // 值类型字段：buffer 中是原始值字节 需要先装箱再包装为 Instance
-        // 缓冲区已按 value_size 动态分配 可容纳任意大小结构体
-        Il2CppClass* valueKlass = resolver.GetClassFromType(fieldType);
-        Il2CppObject* boxed = (valueKlass != nullptr) ? resolver.Box(valueKlass, buffer) : nullptr;
-        LuaBridge_PushInstance(L, boxed, valueKlass);
-        break;
-    }
-    default:
-    {
-        // 引用类型字段（class / object / array）
-        Il2CppObject* obj = *reinterpret_cast<Il2CppObject**>(buffer);
-        LuaBridge_PushInstance(L, obj, nullptr);
-        break;
-    }
-    }
+int LuaBridge_ReadField(lua_State* L, Il2CppObject* obj, const Il2CppField* field)
+{
+    auto& resolver = Il2CppResolver::Instance();
+    const auto* type = resolver.GetFieldType(field);
+    const size_t size = LuaBridge_GetValueStorageSize(type);
+    if (size == 0) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "unsupported field type");
+    void* storage = LuaBridge_NewBuffer(L, size);
+    if (resolver.IsStaticField(field)) resolver.ReadStaticField(field, storage);
+    else resolver.ReadField(obj, field, storage);
+    const int result = LuaBridge_PushFieldValue(L, type, storage);
+    if (result != 1) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "unsupported field value");
+    lua_remove(L, -2);
     return 1;
 }
 
 // fld:write(...)
 // 实例字段传 (Instance, value)，静态字段只传 (value)。
+int LuaBridge_WriteField(lua_State* L, Il2CppObject* obj, const Il2CppField* field, int valueIndex)
+{
+    auto& resolver = Il2CppResolver::Instance();
+    valueIndex = lua_absindex(L, valueIndex);
+    if ((resolver.GetFieldFlags(field) & 0x0040) != 0)
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "const field cannot be written");
+    const Il2CppType* type = resolver.GetFieldType(field);
+    const size_t size = LuaBridge_GetValueStorageSize(type);
+    if (size == 0) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "unsupported field type");
+    void* storage = LuaBridge_NewBuffer(L, size);
+    void* value = nullptr;
+    if (!LuaBridge_MarshalArg(L, valueIndex, type, storage, value, size))
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "failed to marshal field value");
+    const int kind = resolver.GetTypeEnum(type);
+    if (kind == Il2CppTypeEnum::TYPE_PTR || kind == Il2CppTypeEnum::TYPE_FNPTR)
+        value = *static_cast<void**>(storage);
+    if (resolver.IsStaticField(field)) resolver.WriteStaticField(field, value);
+    else resolver.WriteField(obj, field, value);
+    lua_pop(L, 1);
+    return 0;
+}
+
 static int Field_Write(lua_State* L)
 {
-    LuaFieldUD* ud = static_cast<LuaFieldUD*>(luaL_checkudata(L, 1, LuaBridgeMT::FIELD));
+    auto* ud = static_cast<LuaFieldUD*>(luaL_checkudata(L, 1, LuaBridgeMT::FIELD));
     auto& resolver = Il2CppResolver::Instance();
-
-    const Il2CppType* fieldType = resolver.GetFieldType(ud->field);
-    constexpr uint32_t FIELD_ATTRIBUTE_LITERAL = 0x0040;
-    if ((resolver.GetFieldFlags(ud->field) & FIELD_ATTRIBUTE_LITERAL) != 0)
-        return luaL_error(L, "const field cannot be written");
-    uint8_t buffer[16] = {};
-    void* param = nullptr;
-
-    const bool isStatic = resolver.IsStaticField(ud->field);
-    const int valueIndex = isStatic ? 2 : 3;
-    if (isStatic && lua_gettop(L) != 2)
-        return luaL_error(L, "static field write requires one value");
-    if (!isStatic && lua_gettop(L) != 3)
-        return luaL_error(L, "instance field write requires an Instance and a value");
-
-    if (!LuaBridge_MarshalArg(L, valueIndex, fieldType, buffer, param))
-        return luaL_error(L, "failed to marshal field value");
-
-    // 引用类型字段：buffer 中保存的是对象指针
-    // 值类型/基本类型字段：param 直接指向值数据
-    int32_t typeEnum = resolver.GetTypeEnum(fieldType);
-
-    if (isStatic)
+    if (resolver.IsStaticField(ud->field))
     {
-        if (LuaBridge_IsRefType(typeEnum)) resolver.WriteStaticField(ud->field, buffer);
-        else resolver.WriteStaticField(ud->field, param);
+        if (lua_gettop(L) != 2) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "static field write requires one value");
+        return LuaBridge_WriteField(L, nullptr, ud->field, 2);
     }
-    else
-    {
-        LuaInstanceUD* instUD = LuaBridge_CheckInstance(L, 2);
-        if (instUD == nullptr) return luaL_error(L, "instance field write requires an Instance");
-        Il2CppClass* declaringClass = resolver.GetFieldClass(ud->field);
-        if (declaringClass == nullptr) declaringClass = ud->klass;
-        Il2CppClass* instanceClass = instUD->klass;
-        if (instanceClass == nullptr && instUD->obj != nullptr)
-            instanceClass = READ_OFFSET(instUD->obj, 0, Il2CppClass*)[0];
-        if (!resolver.IsAssignableFrom(declaringClass, instanceClass))
-            return luaL_error(L, "instance type is not compatible with field declaring class");
-        if (LuaBridge_IsRefType(typeEnum)) resolver.WriteField(instUD->obj, ud->field, buffer);
-        else resolver.WriteField(instUD->obj, ud->field, param);
-    }
-
-    return 0;
+    if (lua_gettop(L) != 3) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "instance field write requires an Instance and a value");
+    auto* instance = LuaBridge_CheckInstance(L, 2);
+    if (instance == nullptr || !resolver.IsAssignableFrom(resolver.GetFieldClass(ud->field), instance->klass))
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "instance type is not compatible with field declaring class");
+    return LuaBridge_WriteField(L, instance->obj, ud->field, 3);
 }
 
 // fld:__tostring() → string

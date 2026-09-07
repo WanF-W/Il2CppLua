@@ -1,20 +1,17 @@
 /**
- * ============================================================
  * il2cpp_scheduler.cpp — Unity 主线程调度器实现
- * ============================================================
  */
 #include "il2cpp_scheduler.h"
 #include "il2cpp_hook.h"
 #include "il2cpp_resolver.h"
+#include "lua_engine.h"
 #include "pipe_channel.h"
 
 #include <windows.h>
-#include <tlhelp32.h>
 #include <atomic>
 #include <cstdio>
 #include <deque>
 #include <mutex>
-#include <vector>
 
 extern "C" {
 #include "lua.h"
@@ -44,48 +41,8 @@ namespace
     const Il2CppMethod* g_tickMethod = nullptr;
     Il2CppClass* g_tickClass = nullptr;
     bool g_failureLogged = false;
+    bool g_draining = false; // 由 LuaEngine 锁串行保护，阻止任务内嵌套 tick。
     std::atomic<DWORD> g_mainThreadId{0};
-
-    // 进程创建时间最早的线程通常是 WinMain 所在的 Unity 主线程。
-    // 无法识别时返回 0，首次触发 tick 的线程将成为回退值。
-    DWORD ResolveMainThreadId()
-    {
-        DWORD mainId = 0;
-        ULARGE_INTEGER earliest{};
-        bool found = false;
-
-        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (snapshot == INVALID_HANDLE_VALUE) return 0;
-
-        THREADENTRY32 entry{};
-        entry.dwSize = sizeof(entry);
-        if (Thread32First(snapshot, &entry))
-        {
-            do
-            {
-                if (entry.th32OwnerProcessID != GetCurrentProcessId()) continue;
-                HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
-                if (thread == nullptr) continue;
-
-                FILETIME created{}, exited{}, kernel{}, user{};
-                if (GetThreadTimes(thread, &created, &exited, &kernel, &user))
-                {
-                    ULARGE_INTEGER value{};
-                    value.LowPart = created.dwLowDateTime;
-                    value.HighPart = created.dwHighDateTime;
-                    if (!found || value.QuadPart < earliest.QuadPart)
-                    {
-                        found = true;
-                        earliest = value;
-                        mainId = entry.th32ThreadID;
-                    }
-                }
-                CloseHandle(thread);
-            } while (Thread32Next(snapshot, &entry));
-        }
-        CloseHandle(snapshot);
-        return mainId;
-    }
 
     void LogInstallFailureOnce()
     {
@@ -126,9 +83,6 @@ bool Il2CppScheduler::SetTick(const Il2CppMethod* method, Il2CppClass* klass)
     // Hook 层只安装原生跳板；入口选择和公开状态由 Scheduler 持有。
     if (!Il2CppHook::InstallSchedulerTick(method, klass))
     {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        g_tickMethod = nullptr;
-        g_tickClass = nullptr;
         return false;
     }
 
@@ -138,7 +92,9 @@ bool Il2CppScheduler::SetTick(const Il2CppMethod* method, Il2CppClass* klass)
         g_tickClass = klass;
         g_failureLogged = false;
     }
-    g_mainThreadId.store(ResolveMainThreadId(), std::memory_order_relaxed);
+    // 不再根据线程创建时间猜测主线程。首次真正触发所选 tick 的线程
+    // 才会被记录；这要求 set_tick 选择一个稳定地运行在目标线程上的方法。
+    g_mainThreadId.store(0, std::memory_order_relaxed);
     return true;
 }
 
@@ -182,7 +138,7 @@ bool Il2CppScheduler::EnsureInstalled()
 
 void Il2CppScheduler::Drain(lua_State* L)
 {
-    if (L == nullptr) return;
+    if (L == nullptr || g_draining) return;
 
     DWORD mainId = g_mainThreadId.load(std::memory_order_relaxed);
     if (mainId == 0)
@@ -192,12 +148,14 @@ void Il2CppScheduler::Drain(lua_State* L)
     }
     if (GetCurrentThreadId() != mainId) return;
 
+    g_draining = true;
+    struct DrainGuard { ~DrainGuard() { g_draining = false; } } guard;
+
     // 一次性换出当前队列；回调中再次 schedule 的任务留到下一次 tick。
-    std::vector<int> references;
+    std::deque<int> references;
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
-        references.assign(g_queue.begin(), g_queue.end());
-        g_queue.clear();
+        references.swap(g_queue);
     }
 
     // 单个任务失败只记录日志，不阻断同一批次的其他主线程任务。
@@ -211,7 +169,12 @@ void Il2CppScheduler::Drain(lua_State* L)
             continue;
         }
 
-        if (lua_pcall(L, 0, 0, 0) != LUA_OK)
+        LuaEngine::OutputCapture outputCapture;
+        LuaEngine::Instance().BeginOutputCapture(outputCapture);
+        const int status = lua_pcall(L, 0, 0, 0);
+        LuaEngine::Instance().EndOutputCapture(outputCapture);
+
+        if (status != LUA_OK)
         {
             const char* error = lua_tostring(L, -1);
             char message[512];

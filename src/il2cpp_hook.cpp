@@ -1,41 +1,12 @@
-/**
- * ============================================================
- * il2cpp_hook.cpp - IL2CPP 方法 Hook 模块实现
- * ============================================================
- * 核心思路
- * 
- * ·每个被 Hook 的方法分配一段可执行 thunk（mov eax, id; jmp HookDetourEntry）
- * ·所有方法共用 hook_stub.asm 中的 HookDetourEntry 跳板
- * ·跳板保存全部易失寄存器后调用 C++ 分发器 HookDispatch
- * ·分发器按 hookId 找到 HookEntry 再调用 Lua 回调
- * ·回调出错或异常时回跳 MinHook 生成的原始 trampoline
- * ·回调内可通过 original() 调用原方法（参考 frida-il2cpp-bridge）
- *   （临时禁用 Hook 后经 il2cpp_runtime_invoke 合法执行 与 mth:call 同路径）
- * ·Scheduler 的内部 tick Hook 复用同一套跳板，只触发调度器排队任务
- *   不调用用户 Hook 回调，并始终回跳原方法
- *
- * x64 参数布局（MS x64 ABI + IL2CPP 生成代码）
- * 
- * ·实例方法: (this, 参数..., MethodInfo)
- * ·静态方法: (参数..., MethodInfo)
- * ·大结构体返回值(>8字节): 第一个整数参数槽位为返回缓冲区指针
- * ·整数/指针/小结构体(<=8字节): RCX/RDX/R8/R9 或栈
- * ·float/double: XMM0-XMM3 或栈
- *
- * 线程安全
- * 
- * ·Lua 状态机使用可重入互斥锁（回调内可再次触发 Hook）
- * ·锁顺序固定为 Lua -> HookRegistry 避免死锁
- * ·回调期间额外 pin 一份 Lua 函数引用 防止回调内卸载导致悬空
- * ·调度队列和主线程识别由 Il2CppScheduler 独立管理
- * ============================================================
- */
-
+// IL2CPP 原生 Hook：注册表与 Lua 分发。仅 Windows x64 标准 IL2CPP ABI。
+// 原始调用经 NativeInvoke 的独立栈帧调用 MinHook trampoline，不改变全局 Hook 状态。
+// 注册表条目保留到 Shutdown；锁顺序固定为 LuaEngine -> 注册表。
+// 参数和返回值转换共用 lua_value，tick 选择与排队策略属于 Scheduler。
 #include "il2cpp_hook.h"
 #include "hook_stub.h"
 #include "il2cpp_scheduler.h"
 #include "il2cpp_resolver.h"
-#include "lua_bridge.h"
+#include "lua_binding_internal.h"
 #include "lua_engine.h"
 #include "pipe_channel.h"
 #include "../minhook_src/MinHook.h"
@@ -44,19 +15,13 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <vector>
 
-extern "C" {
-#include "lua.h"
-#include "lauxlib.h"
-}
-
-// ============================================================
 // NativeHookContext - 与 hook_stub.asm 共享的内存布局
-// ============================================================
 // 由 HookDetourEntry 在栈上构造，分发器只读/写这些字段
 struct NativeHookContext
 {
@@ -72,12 +37,11 @@ struct NativeHookContext
     uint64_t hookId;       // 0x48: thunk 写入的 hook 编号（RAX）
     uint64_t resultInt;    // 0x50: 整数/指针/小结构体返回值
     uint64_t resultFloat;  // 0x58: float/double 返回值（原始位）
-    void*    original;     // 0x60: 原始 trampoline（非空时回跳）
-    int32_t  hasResult;    // 0x68: 预留
-    int32_t  reserved;     // 0x6c: 预留
+    void*    original;     // 0x60: NativeInvoke 调用目标 / 分发器回退标志
+    int32_t  reserved;     // 0x68: bit 0/1 = Lua/registry 锁，bit 2 = 已调用原方法
 };
 
-// 布局必须与 hook_stub.asm 中的 EQU 完全一致
+// 布局必须与 hook_stub.asm 中的偏移完全一致
 static_assert(offsetof(NativeHookContext, rcx)         == 0x00, "NativeHookContext.rcx offset mismatch");
 static_assert(offsetof(NativeHookContext, rdx)         == 0x08, "NativeHookContext.rdx offset mismatch");
 static_assert(offsetof(NativeHookContext, r8)          == 0x10, "NativeHookContext.r8 offset mismatch");
@@ -91,31 +55,23 @@ static_assert(offsetof(NativeHookContext, hookId)      == 0x48, "NativeHookConte
 static_assert(offsetof(NativeHookContext, resultInt)   == 0x50, "NativeHookContext.resultInt offset mismatch");
 static_assert(offsetof(NativeHookContext, resultFloat) == 0x58, "NativeHookContext.resultFloat offset mismatch");
 static_assert(offsetof(NativeHookContext, original)    == 0x60, "NativeHookContext.original offset mismatch");
-static_assert(offsetof(NativeHookContext, hasResult)   == 0x68, "NativeHookContext.hasResult offset mismatch");
+static_assert(offsetof(NativeHookContext, reserved)     == 0x68, "NativeHookContext.reserved offset mismatch");
 static_assert(sizeof(NativeHookContext) == 0x70, "NativeHookContext size mismatch");
 // 由本文件定义 供 hook_stub.asm 调用的分发器
 extern "C" void HookDispatch(NativeHookContext* ctx);
 // 实际分发逻辑（HookDispatch 的 SEH 安全壳调用）
 static void DispatchSafe(NativeHookContext* ctx);
-
-// ============================================================
 // 参数类型缓存
-// ============================================================
 // 安装 Hook 时把每个参数的反射信息缓存下来
-// 回调线程只需读取缓存 不再依赖反射导出函数
+// 缓存原生布局；类型兼容性与转换仍由统一的 Resolver/值转换接口处理。
 struct HookParam
 {
     int32_t typeEnum   = 0;    // Il2CppTypeEnum
     const Il2CppType* type = nullptr; // 参数原始 Il2CppType（供 original() 显式传参编组）
-    Il2CppClass* klass = nullptr; // 参数对应的类（值类型/引用类型）
     int32_t valueSize  = 0;    // 值类型大小（未知为 0）
     bool isValueType   = false; // 参数是值类型（含泛型值类型）
-    bool isByRef       = false; // ref / out 参数（槽位是指针）
 };
-
-// ============================================================
 // Hook 条目
-// ============================================================
 struct HookEntry
 {
     const Il2CppMethod* method = nullptr; // MethodInfo 指针
@@ -125,7 +81,7 @@ struct HookEntry
     uint32_t hookId = 0;                  // thunk 中写入的编号
 
     bool enabled = false;                 // 当前是否处于启用状态
-    bool isInternalTick = false;          // 内部主线程 tick（不调用 Lua 回调）
+    bool isInternalTick = false;          // 同时作为调度 tick，可与用户回调共存
 
     Il2CppClass* klass = nullptr;         // 声明类
     bool isStatic = false;                // 是否静态方法
@@ -135,10 +91,9 @@ struct HookEntry
     std::vector<HookParam> params;        // 参数类型缓存
 
     int32_t returnEnum = Il2CppTypeEnum::TYPE_VOID; // 返回值类型
-    bool hasReturn = false;               // 是否 void
-    Il2CppClass* returnClass = nullptr;   // 返回值类（值类型时）
+    bool hasReturn = false;               // 是否存在非 void 返回值
     int32_t returnSize = 0;               // 返回值大小（值类型时）
-    bool largeReturn = false;             // 返回值 >8 字节 -> 隐藏返回缓冲区
+    bool largeReturn = false;             // 非 1/2/4/8 字节 struct 使用隐藏返回缓冲区
     const Il2CppType* returnType = nullptr; // original() 推送返回值用的原始返回类型
 
     int luaRef = LUA_REFNIL;              // Lua registry 中的回调引用
@@ -146,46 +101,57 @@ struct HookEntry
 
 // original() 无参调用时保存原始参数槽位的上限（64 个 8 字节槽位）
 constexpr uint32_t HOOK_MAX_ARGS = 64;
-
-// ============================================================
 // OriginalCallState - 每次回调调用分配一份的 original 闭包状态
-// ============================================================
 // 作为 Lua userdata 保存在闭包 upvalue 中
 // 回调结束后 active 置 false 闭包被保存到全局后再次调用会报错
 struct OriginalCallState
 {
-    bool active = false;              // 是否处于回调执行期间
-    const HookEntry* e = nullptr;     // 所属 Hook 条目
-    NativeHookContext* ctx = nullptr; // 当前调用的原生上下文（回调期间有效）
-
-    uint64_t thisRaw = 0;             // 原始 this（实例方法: 对象或裸数据指针）
-    // 原始参数槽位快照（与声明参数一一对应 供无参 original() 使用）
-    uint64_t argSlots[HOOK_MAX_ARGS] = {};
-    int32_t argCount = 0;             // 快照参数个数
+    bool active = false;
+    NativeHookContext* ctx = nullptr;
 };
+
+// NativeInvoke 拥有独立参数栈帧，支持 64 个声明参数及 IL2CPP 隐藏槽位。
+extern "C" void NativeInvoke(NativeHookContext* ctx, uint32_t stackCount);
 
 // original 闭包的 Lua C 函数（upvalue: 1 = HookEntry*, 2 = OriginalCallState*）
 static int OriginalInvoke(lua_State* L);
-
-// ============================================================
 // 全局状态
-// ============================================================
-// 条目永不删除（卸载只禁用）直到 Shutdown
+// 条目永不删除（普通卸载只禁用）直到 Shutdown
 // 因此分发器在 g_mutex 外持有裸指针也是安全的
 static std::mutex g_mutex;
 static std::vector<std::unique_ptr<HookEntry>> g_entries;
 static std::map<const Il2CppMethod*, uint32_t> g_index;
 
 static std::atomic<bool> g_shutdown{false};
-static std::atomic<int32_t> g_activeCallbacks{0};
 static bool g_minhookInitialized = false;
+
+// 该计数由 C++ 与汇编共同维护，覆盖从进入 detour 到原函数返回的完整
+// 时间段。仅统计 Lua 回调不足以保护原方法执行和 MinHook 状态，因为原方法
+// 可能在 C++ 分发器内部通过 trampoline 执行。
+extern "C" std::atomic<int64_t> g_activeDetours{0};
 
 // 内部 tick Hook 仍由 Hook 引擎持有，调度队列与入口元数据由 Il2CppScheduler 管理。
 static bool g_tickInstalled = false;
 static uint32_t g_tickHookId = UINT32_MAX;
 
-// thunk 大小（mov eax,imm32 + jmp [rip+0] + 8 字节地址，16 字节对齐）
-constexpr uint32_t HOOK_THUNK_SIZE = 16;
+// thunk 大小（mov eax,imm32 + jmp [rip+0] + 8 字节地址，共 19 字节）
+constexpr uint32_t HOOK_THUNK_SIZE = 19;
+
+// 汇编入口只传递 hookId。这里仅获取条目保存的 trampoline 作为回退标志；
+// 原方法实际由 InvokeOriginalFallback 在 C++ 中执行。
+static void* LookupOriginal(uint64_t hookId)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (hookId >= g_entries.size()) return nullptr;
+    const HookEntry* entry = g_entries[static_cast<size_t>(hookId)].get();
+    return entry != nullptr ? entry->original : nullptr;
+}
+static HookEntry* LookupEntry(uint64_t hookId)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (hookId >= g_entries.size()) return nullptr;
+    return g_entries[static_cast<size_t>(hookId)].get();
+}
 
 // MS x64 ABI 规定只有 1/2/4/8 字节的结构体按值使用寄存器传递
 // 其他大小的结构体一律通过指针传递（隐藏返回缓冲区同理）
@@ -193,10 +159,7 @@ static bool HookIsRegisterStruct(int32_t size)
 {
     return size == 1 || size == 2 || size == 4 || size == 8;
 }
-
-// ============================================================
 // 内部工具：MinHook 初始化
-// ============================================================
 static bool EnsureMinHookInitialized()
 {
     if (g_minhookInitialized) return true;
@@ -206,10 +169,7 @@ static bool EnsureMinHookInitialized()
     g_minhookInitialized = true;
     return true;
 }
-
-// ============================================================
 // 内部工具：thunk 分配
-// ============================================================
 // thunk 机器码:
 //   B8 <id32>            mov eax, imm32     ; 传递 hookId
 //   FF 25 00000000       jmp qword ptr [rip+0]
@@ -239,9 +199,61 @@ static void* AllocateThunk(uint32_t hookId, void* detour)
     return mem;
 }
 
-// ============================================================
+// 填充用户 Hook 与内部 tick 共用的方法元数据。
+// 两条路径都必须知道 this、参数槽位和返回值 ABI；如果只给 tick 安装
+// 一个“空条目”，静态 getter 的返回值就会被错误地当成 void 丢失。
+static bool PopulateHookMetadata(
+    HookEntry* entry, const Il2CppMethod* method, Il2CppClass* fallbackClass)
+{
+    if (entry == nullptr || method == nullptr) return false;
+
+    auto& resolver = Il2CppResolver::Instance();
+    entry->method = method;
+    entry->klass = resolver.GetMethodClass(method);
+    if (entry->klass == nullptr) entry->klass = fallbackClass;
+    if (entry->klass == nullptr) return false;
+    entry->isStatic = resolver.IsStaticMethod(method);
+    entry->isValueTypeClass = resolver.IsValueType(entry->klass)
+        || resolver.IsEnum(entry->klass);
+
+    entry->paramCount = resolver.GetMethodParamCount(method);
+    if (entry->paramCount < 0
+        || entry->paramCount > static_cast<int32_t>(HOOK_MAX_ARGS)) return false;
+    entry->params.clear();
+    entry->params.reserve(static_cast<size_t>(entry->paramCount));
+
+    // 泛型共享代码可能采用额外 ABI；普通调用仍通过 runtime_invoke 支持闭合泛型。
+    if (resolver.IsGenericMethod(method) || resolver.IsInflatedMethod(method)) return false;
+    for (int i = 0; i < entry->paramCount; ++i)
+    {
+        HookParam p;
+        p.type = resolver.GetMethodParamType(method, i);
+        if (p.type == nullptr || resolver.IsByRef(p.type)) return false;
+        p.typeEnum = LuaBridge_GetEffectiveTypeEnum(p.type);
+        const size_t size = LuaBridge_GetValueStorageSize(p.type);
+        if (size == 0) return false;
+        p.isValueType = p.typeEnum == Il2CppTypeEnum::TYPE_VALUETYPE;
+        p.valueSize = static_cast<int32_t>(size);
+        entry->params.push_back(p);
+    }
+
+    const Il2CppType* returnType = resolver.GetMethodReturnType(method);
+    if (returnType == nullptr || resolver.IsByRef(returnType)) return false;
+    entry->returnType = returnType;
+    entry->returnEnum = returnType
+        ? LuaBridge_GetEffectiveTypeEnum(returnType) : Il2CppTypeEnum::TYPE_VOID;
+    entry->hasReturn = entry->returnEnum != Il2CppTypeEnum::TYPE_VOID;
+    if (entry->hasReturn && LuaBridge_GetValueStorageSize(returnType) == 0) return false;
+
+    if (entry->returnEnum == Il2CppTypeEnum::TYPE_VALUETYPE)
+    {
+        entry->returnSize = static_cast<int32_t>(LuaBridge_GetValueStorageSize(returnType));
+        entry->largeReturn = !HookIsRegisterStruct(entry->returnSize);
+    }
+
+    return true;
+}
 // 内部 tick Hook 后端
-// ============================================================
 // 调度策略位于 il2cpp_scheduler.cpp；这里仅负责复用原生 Hook 跳板。
 static bool TryInstallTickHook(const Il2CppMethod* method, Il2CppClass* klass)
 {
@@ -261,6 +273,7 @@ static bool TryInstallTickHook(const Il2CppMethod* method, Il2CppClass* klass)
     {
         HookEntry* existing = g_entries[i].get();
         if (existing == nullptr || existing->target != target) continue;
+        if (existing->method != method) return false;
 
         const MH_STATUS status = MH_EnableHook(target);
         if (status != MH_OK && status != MH_ERROR_ENABLED) return false;
@@ -273,12 +286,11 @@ static bool TryInstallTickHook(const Il2CppMethod* method, Il2CppClass* klass)
     }
 
     // 构建条目，复用与用户 Hook 相同的 thunk + HookDetourEntry 机制
-    // 该机制保存全部参数寄存器 回跳时原样恢复 可适配任意方法签名
+    // 只接受 PopulateHookMetadata 明确支持的签名。
     auto entry = std::make_unique<HookEntry>();
     entry->hookId = static_cast<uint32_t>(g_entries.size());
     entry->target = target;
-    entry->method = method;
-    entry->klass = klass;
+    if (!PopulateHookMetadata(entry.get(), method, klass)) return false;
     entry->isInternalTick = true;   // 分发器走 tick 分支
     entry->luaRef = LUA_REFNIL;
 
@@ -306,10 +318,7 @@ static bool TryInstallTickHook(const Il2CppMethod* method, Il2CppClass* klass)
     g_tickInstalled = true;
     return true;
 }
-
-// ============================================================
 // 参数槽位游标（x64 寄存器/栈分配）
-// ============================================================
 // MS x64 ABI 按参数位置分配寄存器（与 System V 不同）:
 // ·第 0..3 个参数按位置使用 RCX/RDX/R8/R9（整数）或 XMM0-XMM3（浮点）
 //  例如 f(int, double, int) -> RCX, XMM1, R8
@@ -344,629 +353,192 @@ static uint64_t ReadXmmArg(const NativeHookContext* ctx, ArgCursor& cur)
     const uint64_t* stack = reinterpret_cast<const uint64_t*>(ctx->stackArgs);
     return stack[cur.stackIdx++];
 }
-
-// ============================================================
-// original() 参数编组（原始槽位 / Lua 显式参数 -> runtime_invoke params）
-// ============================================================
-// 执行原方法统一走 il2cpp_runtime_invoke（与 mth:call 同一条已验证路径）
-// 参考 frida-il2cpp-bridge tracer: revert -> nativeFunction -> replace
-// 对应这里: 临时禁用 Hook -> runtime_invoke -> 恢复 Hook
-// 由 IL2CPP 运行时按内部 ABI 合法执行原方法（含装箱/虚分发/异常处理）
-// 不再自造汇编调用帧
-
-// 快照原始参数槽位（构造 original 闭包时调用）
-// 无参 original() 时按声明参数顺序原样透传给 runtime_invoke
-static void SnapshotOriginalArgs(OriginalCallState* st, const NativeHookContext* ctx, const HookEntry* e)
+// 原方法调用保留 this、参数寄存器、栈槽和尾部 MethodInfo。
+static uint32_t NativeStackCount(const HookEntry* e)
 {
-    ArgCursor cur;
-
-    // 大结构体返回值会占用第一个整数槽位（隐藏返回缓冲区）
-    if (e->largeReturn) ReadIntArg(ctx, cur);
-
-    // this 单独保存 参数游标从声明参数开始
-    if (!e->isStatic) st->thisRaw = ReadIntArg(ctx, cur);
-
-    st->argCount = e->paramCount;
-    for (int32_t i = 0; i < e->paramCount; ++i)
-    {
-        const HookParam& p = e->params[static_cast<size_t>(i)];
-        if (p.typeEnum == Il2CppTypeEnum::TYPE_R4 || p.typeEnum == Il2CppTypeEnum::TYPE_R8)
-        {
-            st->argSlots[static_cast<size_t>(i)] = ReadXmmArg(ctx, cur);
-        }
-        else
-        {
-            st->argSlots[static_cast<size_t>(i)] = ReadIntArg(ctx, cur);
-        }
-    }
+    const uint32_t slots = e->paramCount + (e->isStatic ? 0 : 1) + (e->largeReturn ? 1 : 0) + 1;
+    return slots > 4 ? slots - 4 : 0; // 最后一槽为 MethodInfo。
 }
 
-// 无参 original(): 把原始槽位值转为 runtime_invoke 的 params[i]
-// 引用类型 / ref/out / 大值类型: 槽位本身就是指针 直接透传
-// 基本类型 / 寄存器值类型: 拷入 storage 后传地址
-static bool OriginalSlotToParam(const HookParam& p, uint64_t raw, void* storage, void*& outParam)
+static bool CallNativeSafe(NativeHookContext* call, uint32_t stackCount)
 {
-    // ref/out: 槽位即 byref 指针 原样透传（原方法直接读写调用方变量）
-    if (p.isByRef)
-    {
-        outParam = reinterpret_cast<void*>(raw);
-        return true;
-    }
-
-    // 浮点参数: XMM 槽位低 4/8 字节即数值
-    if (p.typeEnum == Il2CppTypeEnum::TYPE_R4 || p.typeEnum == Il2CppTypeEnum::TYPE_R8)
-    {
-        memcpy(storage, &raw, (p.typeEnum == Il2CppTypeEnum::TYPE_R4) ? 4 : 8);
-        outParam = storage;
-        return true;
-    }
-
-    // 值类型: <=8 字节时槽位即原始位 其余槽位是数据指针
-    if (p.isValueType)
-    {
-        if (HookIsRegisterStruct(p.valueSize))
-        {
-            memcpy(storage, &raw, static_cast<size_t>(p.valueSize));
-            outParam = storage;
-        }
-        else
-        {
-            outParam = reinterpret_cast<void*>(raw);
-        }
-        return true;
-    }
-
-    // 引用类型: 槽位即对象指针 直接透传
-    switch (p.typeEnum)
-    {
-    case Il2CppTypeEnum::TYPE_STRING:
-    case Il2CppTypeEnum::TYPE_CLASS:
-    case Il2CppTypeEnum::TYPE_OBJECT:
-    case Il2CppTypeEnum::TYPE_SZARRAY:
-    case Il2CppTypeEnum::TYPE_ARRAY:
-    case Il2CppTypeEnum::TYPE_GENERICINST:
-        outParam = reinterpret_cast<void*>(raw);
-        return true;
-    default:
-        break;
-    }
-
-    // 基本类型: 寄存器按 8 字节零扩展 拷贝后低字节即正确值
-    memcpy(storage, &raw, sizeof(uint64_t));
-    outParam = storage;
+    __try { NativeInvoke(call, stackCount); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     return true;
 }
 
-// 显式传参时 ref/out 参数编组（与旧版 hook 行为一致 回调内修改不回写）
-static bool MarshalLuaByref(lua_State* L, int idx, const HookParam& p, void* storage, void*& outParam)
+static bool InvokeOriginalFallback(const HookEntry* e, NativeHookContext* ctx)
 {
-    auto& resolver = Il2CppResolver::Instance();
-
-    // 值类型 byref: params[i] 即数据指针 数值拷入 storage 后传 storage
-    if (p.isValueType)
+    if (e == nullptr || ctx == nullptr || e->original == nullptr) return false;
+    if ((ctx->reserved & 4) != 0) return true; // 已调用，不能在错误路径重复副作用。
+    ctx->reserved |= 4;
+    NativeHookContext call = *ctx;
+    call.original = e->original;
+    const bool ok = CallNativeSafe(&call, NativeStackCount(e));
+    ctx->resultInt = call.resultInt;
+    ctx->resultFloat = call.resultFloat;
+    if (!ok)
     {
-        if (p.valueSize <= 8)
+        ctx->resultInt = 0;
+        ctx->resultFloat = 0;
+        if (e->largeReturn)
         {
-            uint64_t bits = 0;
-            if (lua_islightuserdata(L, idx))
-            {
-                memcpy(&bits, lua_touserdata(L, idx), static_cast<size_t>(p.valueSize));
-            }
-            else if (!lua_isnil(L, idx))
-            {
-                LuaInstanceUD* ud = LuaBridge_CheckInstance(L, idx);
-                if (ud != nullptr && ud->obj != nullptr)
-                {
-                    void* data = resolver.Unbox(ud->obj);
-                    if (data != nullptr) memcpy(&bits, data, static_cast<size_t>(p.valueSize));
-                }
-            }
-            memcpy(storage, &bits, static_cast<size_t>(p.valueSize));
-            outParam = storage;
+            memset(reinterpret_cast<void*>(ctx->rcx), 0, e->returnSize);
+            ctx->resultInt = ctx->rcx;
         }
-        else
-        {
-            // 大值类型 byref: 直接传数据指针
-            if (lua_islightuserdata(L, idx)) outParam = lua_touserdata(L, idx);
-            else if (!lua_isnil(L, idx))
-            {
-                LuaInstanceUD* ud = LuaBridge_CheckInstance(L, idx);
-                outParam = (ud != nullptr && ud->obj != nullptr) ? resolver.Unbox(ud->obj) : nullptr;
-            }
-            else outParam = nullptr;
-        }
-        return true;
+        PipeChannel::Instance().SendLog("[hook] original method raised an exception; invocation was not repeated");
     }
-
-    // 引用类型 byref: params[i] 指向保存对象指针的槽位
-    Il2CppObject* obj = nullptr;
-    if (!lua_isnil(L, idx))
-    {
-        LuaInstanceUD* ud = LuaBridge_CheckInstance(L, idx);
-        if (ud != nullptr) obj = ud->obj;
-    }
-    *reinterpret_cast<Il2CppObject**>(storage) = obj;
-    outParam = storage;
-    return true;
+    return ok;
 }
 
-// 调用原方法: 临时禁用 Hook 保证 runtime_invoke 不重入 结束后恢复
-// 使用 __try/__finally 确保即使原生访问违例也会恢复 Hook
-// （本函数没有需要展开的 C++ 对象 满足 /EHsc 的 C2712 限制）
-static Il2CppObject* CallOriginalSafe(const Il2CppMethod* method, void* obj, void** params, void* hookTarget, Il2CppException** exc)
-{
-    // hookTarget 非空表示调用方已临时禁用 Hook 由本函数负责恢复
-    Il2CppObject* result = nullptr;
-    __try
-    {
-        result = Il2CppResolver::Instance().RuntimeInvoke(method, obj, params, exc);
-    }
-    __finally
-    {
-        // 无论正常返回还是访问违例都必须恢复 Hook
-        if (hookTarget != nullptr)
-        {
-            MH_STATUS es = MH_EnableHook(hookTarget);
-            if (es != MH_OK && es != MH_ERROR_ENABLED)
-            {
-                PipeChannel::Instance().SendLog("[hook] failed to re-enable hook after original()");
-            }
-        }
-    }
-    return result;
-}
-
-// ============================================================
-// original 闭包: 在回调体内调用原方法
-// ============================================================
-// 用法: function(this, original, ...)
-//   ·original()            -- 使用原始参数调用原方法
-//   ·original(a, b)        -- 使用替换参数调用原方法
-//   ·返回值就是原方法的返回值
 static int OriginalInvoke(lua_State* L)
 {
-    HookEntry* e = static_cast<HookEntry*>(lua_touserdata(L, lua_upvalueindex(1)));
-    OriginalCallState* st = static_cast<OriginalCallState*>(lua_touserdata(L, lua_upvalueindex(2)));
+    auto* e = static_cast<HookEntry*>(lua_touserdata(L, lua_upvalueindex(1)));
+    auto* st = static_cast<OriginalCallState*>(lua_touserdata(L, lua_upvalueindex(2)));
+    if (st == nullptr || !st->active || e == nullptr || st->ctx == nullptr)
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "original can only be called inside the hook callback");
+    const int argc = lua_gettop(L);
+    if (!lua_checkstack(L, e->paramCount * 2 + 8)) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "original: Lua stack capacity exceeded");
+    if (argc != 0 && argc != e->paramCount)
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "original: expected %d arguments, got %d", e->paramCount, argc);
 
-    // 闭包只能在回调执行期间调用
-    if (st == nullptr || !st->active || e == nullptr || st->ctx == nullptr || e->method == nullptr)
+    NativeHookContext call = *st->ctx;
+    call.original = e->original;
+    uint64_t stack[HOOK_MAX_ARGS] = {};
+    const uint32_t stackCount = NativeStackCount(e);
+    if (stackCount != 0) memcpy(stack, reinterpret_cast<void*>(call.stackArgs), stackCount * sizeof(uint64_t));
+    call.stackArgs = reinterpret_cast<uint64_t>(stack);
+
+    // this 与尾部 MethodInfo 始终沿用原调用。替换参数只更新声明参数槽位。
+    int slot = (e->largeReturn ? 1 : 0) + (e->isStatic ? 0 : 1);
+    for (int i = 0; argc != 0 && i < e->paramCount; ++i, ++slot)
     {
-        return luaL_error(L, "original can only be called inside the hook callback");
-    }
-
-    int argc = lua_gettop(L);
-    bool explicitArgs = argc > 0;
-
-    if (explicitArgs && argc != e->paramCount)
-    {
-        return luaL_error(L, "original: expected %d arguments, got %d", e->paramCount, argc);
-    }
-
-    auto& resolver = Il2CppResolver::Instance();
-
-    // ---- 准备 this（与 mth:call 一致: 引用类型传对象指针 静态传 nullptr）----
-    void* obj = nullptr;
-    if (!e->isStatic)
-    {
-        if (e->isValueTypeClass)
+        const HookParam& p = e->params[i];
+        const size_t size = LuaBridge_GetValueStorageSize(p.type);
+        void* storage = LuaBridge_NewBuffer(L, size);
+        void* param = nullptr;
+        if (!LuaBridge_MarshalArg(L, i + 1, p.type, storage, param, size))
+            return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "original: failed to marshal argument %d", i + 1);
+        uint64_t raw = 0;
+        if (LuaBridge_IsRefType(p.type))
         {
-            // 值类型方法: this 可能是盒装对象 也可能是裸数据指针（Unity 版本差异）
-            // 通过对象头第一个字段是否等于声明类来区分
-            Il2CppClass* headKlass = nullptr;
-            if (st->thisRaw != 0) headKlass = *reinterpret_cast<Il2CppClass**>(st->thisRaw);
-            if (st->thisRaw != 0 && headKlass == e->klass)
-            {
-                obj = reinterpret_cast<void*>(st->thisRaw);
-            }
-            else if (st->thisRaw != 0)
-            {
-                // 裸数据指针: runtime_invoke 需要盒装对象 先装箱
-                obj = resolver.Box(e->klass, reinterpret_cast<void*>(st->thisRaw));
-            }
-            // thisRaw == 0: 保持 nullptr 与原调用一致（原方法自身会处理）
+            raw = reinterpret_cast<uint64_t>(param);
+            if (p.typeEnum == Il2CppTypeEnum::TYPE_STRING && param != nullptr)
+                LuaBridge_PushInstance(L, static_cast<Il2CppObject*>(param));
         }
-        else
+        else if (p.isValueType && !HookIsRegisterStruct(p.valueSize))
         {
-            obj = reinterpret_cast<void*>(st->thisRaw);
+            // MS x64 间接传值参数必须指向调用方副本，不能让原方法改写装箱对象。
+            memcpy(storage, param, size);
+            raw = reinterpret_cast<uint64_t>(storage);
         }
+        else memcpy(&raw, param, size);
+        if (slot < 4)
+        {
+            if (p.typeEnum == Il2CppTypeEnum::TYPE_R4 || p.typeEnum == Il2CppTypeEnum::TYPE_R8)
+                reinterpret_cast<uint64_t*>(&call.xmm0)[slot] = raw;
+            else reinterpret_cast<uint64_t*>(&call.rcx)[slot] = raw;
+        }
+        else stack[slot - 4] = raw;
     }
-
-    // ---- 编组参数为 runtime_invoke 的 void** params ----
-    // 使用固定大小数组（栈上分配）避免 longjmp 绕过析构导致资源泄漏
-    if (e->paramCount > static_cast<int32_t>(HOOK_MAX_ARGS))
+    // 独立返回缓冲区保留最近一次成功结果；失败不能留下部分写入的数据。
+    if (e->largeReturn) call.rcx = reinterpret_cast<uint64_t>(LuaBridge_NewBuffer(L, e->returnSize));
+    const bool attemptedBefore = (st->ctx->reserved & 4) != 0;
+    // 在进入原方法前标记，抛异常也不允许 fallback 再次执行。
+    st->ctx->reserved |= 4;
+    if (!CallNativeSafe(&call, stackCount))
     {
-        return luaL_error(L, "original: too many parameters (%d)", e->paramCount);
-    }
-    alignas(16) uint8_t storages[HOOK_MAX_ARGS * 16] = {};
-    void* params[HOOK_MAX_ARGS] = {};
-
-    for (int32_t i = 0; i < e->paramCount; ++i)
-    {
-        void*& outParam = params[static_cast<size_t>(i)];
-        void* storage = storages + static_cast<size_t>(i) * 16;
-
-        if (explicitArgs)
+        if (!attemptedBefore && e->largeReturn)
         {
-            // 显式传参: ref/out 走专用编组 其余复用 mth:call 的 MarshalArg
-            const HookParam& hp = e->params[static_cast<size_t>(i)];
-            if (hp.isByRef)
-            {
-                if (!MarshalLuaByref(L, i + 1, hp, storage, outParam))
-                {
-                    return luaL_error(L, "original: failed to marshal argument %d", i + 1);
-                }
-                continue;
-            }
-
-            // 使用 Hook 安装时缓存的参数类型 回调线程不再触碰反射 API
-            if (hp.type == nullptr)
-            {
-                return luaL_error(L, "original: failed to get parameter %d type", i + 1);
-            }
-            if (!LuaBridge_MarshalArg(L, i + 1, hp.type, storage, outParam))
-            {
-                return luaL_error(L, "original: failed to marshal argument %d", i + 1);
-            }
+            memset(reinterpret_cast<void*>(st->ctx->rcx), 0, e->returnSize);
+            st->ctx->resultInt = st->ctx->rcx;
         }
-        else
-        {
-            // 无参 original(): 使用原始参数
-            if (!OriginalSlotToParam(e->params[static_cast<size_t>(i)], st->argSlots[static_cast<size_t>(i)], storage, outParam))
-            {
-                return luaL_error(L, "original: failed to marshal argument %d", i + 1);
-            }
-        }
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "original: native or managed exception; invocation was not repeated");
     }
-
-    // ---- 临时禁用 Hook（失败则报错 避免 runtime_invoke 重入回调）----
-    // runtime_invoke 会经 methodPointer 进入函数体
-    // 若 Hook 仍启用会重新进入本回调 形成无限递归
-    void* hookTarget = nullptr;
-    if (e->target != nullptr)
-    {
-        MH_STATUS ds = MH_DisableHook(e->target);
-        if (ds == MH_OK)
-        {
-            hookTarget = e->target;
-        }
-        else if (ds != MH_ERROR_DISABLED)
-        {
-            return luaL_error(L, "original: failed to disable hook (status %d)", static_cast<int>(ds));
-        }
-        // MH_ERROR_DISABLED: 已被其他路径临时禁用 直接调用原方法即可
-    }
-
-    // 调用原方法（结束后恢复 Hook） 此时线程已由分发器附加到 IL2CPP 运行时
-    // 与 mth:call 的执行环境一致 由运行时合法执行原方法
-    Il2CppException* exc = nullptr;
-    Il2CppObject* result = CallOriginalSafe(
-        e->method, obj, e->paramCount > 0 ? params : nullptr, hookTarget, &exc);
-
-    if (exc != nullptr)
-    {
-        // 原方法抛出 C# 异常: 记录并转为 Lua 错误（分发器会回跳原始函数）
-        PipeChannel::Instance().SendLog("[hook] original method threw a C# exception");
-        return luaL_error(L, "original: C# exception thrown by method");
-    }
-
-    // 返回值与 mth:call 一致：void 返回 0 个 Lua 值，其他类型返回 1 个。
-    return LuaBridge_PushReturnValue(L, result, e->returnType);
+    if (e->largeReturn)
+        memcpy(reinterpret_cast<void*>(st->ctx->rcx), reinterpret_cast<void*>(call.rcx), e->returnSize);
+    st->ctx->resultInt = e->largeReturn ? st->ctx->rcx : call.resultInt;
+    st->ctx->resultFloat = call.resultFloat;
+    if (!e->hasReturn) return 0;
+    void* value = e->largeReturn ? reinterpret_cast<void*>(call.rcx)
+        : (e->returnEnum == Il2CppTypeEnum::TYPE_R4 || e->returnEnum == Il2CppTypeEnum::TYPE_R8)
+        ? static_cast<void*>(&call.resultFloat) : static_cast<void*>(&call.resultInt);
+    return LuaBridge_PushFieldValue(L, e->returnType, value);
 }
-
-// ============================================================
 // 原生参数 -> Lua 值
-// ============================================================
-
 // 压入 this 参数（实例对象 / 值类型装箱 / 静态方法压声明类）
 static void PushThisValue(lua_State* L, const HookEntry* e, uint64_t raw)
 {
     auto& resolver = Il2CppResolver::Instance();
 
-    // 静态方法与 frida-il2cpp-bridge 一致: this 为声明类
+    // 静态方法与 frida-il2cpp-bridge 一致: this 为声明类。
     if (e->isStatic)
     {
         LuaBridge_PushClass(L, e->klass);
         return;
     }
 
+    if (raw == 0)
+    {
+        // 空实例指针不是正常的 C# 调用，但回调层仍应能安全地看到 nil，
+        // 而不是在解读对象头时再次触发访问违例。
+        LuaBridge_PushInstance(L, nullptr);
+        return;
+    }
+
     if (e->isValueTypeClass)
     {
-        // 值类型方法在部分 Unity 版本中 this 是装箱对象
-        // 在 2021.2+ 中则是裸数据指针 通过对象头 klass 判断
-        Il2CppClass* headKlass = nullptr;
-        headKlass = *reinterpret_cast<Il2CppClass**>(raw);
-        if (headKlass == e->klass)
-        {
-            LuaBridge_PushInstance(L, reinterpret_cast<Il2CppObject*>(raw), e->klass);
-        }
-        else
-        {
-            Il2CppObject* boxed = resolver.Box(e->klass, reinterpret_cast<void*>(raw));
-            LuaBridge_PushInstance(L, boxed, e->klass);
-        }
+        // Lua 观察到的是值类型快照；original 始终使用原生 this，保留原方法写入。
+        LuaBridge_PushInstance(L, resolver.Box(e->klass, reinterpret_cast<void*>(raw)));
         return;
     }
 
     // 引用类型实例直接包装 类从对象头读取（兼容子类）
-    LuaBridge_PushInstance(L, reinterpret_cast<Il2CppObject*>(raw), nullptr);
+    LuaBridge_PushInstance(L, reinterpret_cast<Il2CppObject*>(raw));
 }
 
 // 压入一个原生参数（已经按类型读取对应槽位）
 static void PushNativeParam(lua_State* L, const HookParam& p, const NativeHookContext* ctx, ArgCursor& cur)
 {
-    auto& resolver = Il2CppResolver::Instance();
-
-    // ref / out 参数: 槽位本身是指针
-    if (p.isByRef)
-    {
-        uint64_t rawPtr = ReadIntArg(ctx, cur);
-        void* ptr = reinterpret_cast<void*>(rawPtr);
-        if (p.isValueType)
-        {
-            // 值类型 byref: 指针指向原始数据 装箱后包装为 Instance
-            Il2CppObject* boxed = (ptr != nullptr) ? resolver.Box(p.klass, ptr) : nullptr;
-            LuaBridge_PushInstance(L, boxed, p.klass);
-        }
-        else
-        {
-            // 引用类型 byref: 指针指向对象引用
-            Il2CppObject* obj = nullptr;
-            if (ptr != nullptr) obj = *reinterpret_cast<Il2CppObject**>(ptr);
-            LuaBridge_PushInstance(L, obj, p.klass);
-        }
-        return;
-    }
-
-    // 浮点参数走 XMM 槽位
-    if (p.typeEnum == Il2CppTypeEnum::TYPE_R4 || p.typeEnum == Il2CppTypeEnum::TYPE_R8)
-    {
-        uint64_t raw = ReadXmmArg(ctx, cur);
-        if (p.typeEnum == Il2CppTypeEnum::TYPE_R4)
-        {
-            float f = 0.0f;
-            memcpy(&f, &raw, sizeof(float));
-            lua_pushnumber(L, f);
-        }
-        else
-        {
-            double d = 0.0;
-            memcpy(&d, &raw, sizeof(double));
-            lua_pushnumber(L, d);
-        }
-        return;
-    }
-
-    // 其余参数走整数槽位
-    uint64_t raw = ReadIntArg(ctx, cur);
-
-    // 值类型（含泛型值类型）: <=8 字节时槽位就是原始值 >8 字节时槽位是指针
-    if (p.isValueType)
-    {
-        if (HookIsRegisterStruct(p.valueSize))
-        {
-            uint8_t buf[8] = {};
-            memcpy(buf, &raw, static_cast<size_t>(p.valueSize));
-            Il2CppObject* boxed = resolver.Box(p.klass, buf);
-            LuaBridge_PushInstance(L, boxed, p.klass);
-        }
-        else
-        {
-            Il2CppObject* boxed = resolver.Box(p.klass, reinterpret_cast<void*>(raw));
-            LuaBridge_PushInstance(L, boxed, p.klass);
-        }
-        return;
-    }
-
-    switch (p.typeEnum)
-    {
-    case Il2CppTypeEnum::TYPE_BOOLEAN:
-        lua_pushboolean(L, (raw & 1) != 0);
-        break;
-    case Il2CppTypeEnum::TYPE_CHAR:
-        lua_pushinteger(L, static_cast<uint16_t>(raw));
-        break;
-    case Il2CppTypeEnum::TYPE_I1:
-        lua_pushinteger(L, static_cast<int8_t>(raw));
-        break;
-    case Il2CppTypeEnum::TYPE_U1:
-        lua_pushinteger(L, static_cast<uint8_t>(raw));
-        break;
-    case Il2CppTypeEnum::TYPE_I2:
-        lua_pushinteger(L, static_cast<int16_t>(raw));
-        break;
-    case Il2CppTypeEnum::TYPE_U2:
-        lua_pushinteger(L, static_cast<uint16_t>(raw));
-        break;
-    case Il2CppTypeEnum::TYPE_I4:
-        lua_pushinteger(L, static_cast<int32_t>(raw));
-        break;
-    case Il2CppTypeEnum::TYPE_U4:
-        lua_pushinteger(L, static_cast<uint32_t>(raw));
-        break;
-    case Il2CppTypeEnum::TYPE_I8:
-        lua_pushinteger(L, static_cast<int64_t>(raw));
-        break;
-    case Il2CppTypeEnum::TYPE_U8:
-        // lua_Integer 为有符号 64 位 超过 INT64_MAX 会回绕
-        lua_pushinteger(L, static_cast<lua_Integer>(raw));
-        break;
-    case Il2CppTypeEnum::TYPE_I:
-    case Il2CppTypeEnum::TYPE_U:
-    case Il2CppTypeEnum::TYPE_ENUM:
-        lua_pushinteger(L, static_cast<lua_Integer>(raw));
-        break;
-    case Il2CppTypeEnum::TYPE_STRING:
-    {
-        Il2CppString* str = reinterpret_cast<Il2CppString*>(raw);
-        if (str != nullptr) LuaBridge_PushString(L, str);
-        else lua_pushnil(L);
-        break;
-    }
-    case Il2CppTypeEnum::TYPE_CLASS:
-    case Il2CppTypeEnum::TYPE_OBJECT:
-    case Il2CppTypeEnum::TYPE_SZARRAY:
-    case Il2CppTypeEnum::TYPE_ARRAY:
-    case Il2CppTypeEnum::TYPE_GENERICINST:
-        LuaBridge_PushInstance(L, reinterpret_cast<Il2CppObject*>(raw), p.klass);
-        break;
-    case Il2CppTypeEnum::TYPE_PTR:
-    case Il2CppTypeEnum::TYPE_FNPTR:
-    case Il2CppTypeEnum::TYPE_TYPEDBYREF:
-        if (raw != 0) lua_pushlightuserdata(L, reinterpret_cast<void*>(raw));
-        else lua_pushnil(L);
-        break;
-    default:
-        // 未知类型按原始整数透传 避免误判导致崩溃
-        lua_pushinteger(L, static_cast<lua_Integer>(raw));
-        break;
-    }
+    uint64_t raw = (p.typeEnum == Il2CppTypeEnum::TYPE_R4 || p.typeEnum == Il2CppTypeEnum::TYPE_R8)
+        ? ReadXmmArg(ctx, cur) : ReadIntArg(ctx, cur);
+    void* value = p.isValueType && !HookIsRegisterStruct(p.valueSize)
+        ? reinterpret_cast<void*>(raw) : static_cast<void*>(&raw);
+    LuaBridge_PushFieldValue(L, p.type, value);
 }
 
-// ============================================================
-// Lua 返回值 -> 原生返回值
-// ============================================================
-
-// 整数/指针/引用/小结构体返回值的编组
-static uint64_t MarshalReturnInt(lua_State* L, const HookEntry* e, NativeHookContext* ctx, int idx)
+static bool MarshalLuaReturn(lua_State* L, const HookEntry* e, NativeHookContext* ctx, int idx)
 {
-    auto& resolver = Il2CppResolver::Instance();
-
-    switch (e->returnEnum)
+    if (!e->hasReturn) return true;
+    idx = lua_absindex(L, idx);
+    const size_t size = LuaBridge_GetValueStorageSize(e->returnType);
+    void* storage = LuaBridge_NewBuffer(L, size);
+    void* value = nullptr;
+    if (!LuaBridge_MarshalArg(L, idx, e->returnType, storage, value, size))
     {
-    case Il2CppTypeEnum::TYPE_BOOLEAN:
-        return lua_toboolean(L, idx) ? 1 : 0;
-    case Il2CppTypeEnum::TYPE_CHAR:
-        return static_cast<uint16_t>(lua_tointeger(L, idx));
-    case Il2CppTypeEnum::TYPE_I1:
-        return static_cast<uint8_t>(lua_tointeger(L, idx));
-    case Il2CppTypeEnum::TYPE_U1:
-        return static_cast<uint8_t>(lua_tointeger(L, idx));
-    case Il2CppTypeEnum::TYPE_I2:
-        return static_cast<uint16_t>(lua_tointeger(L, idx));
-    case Il2CppTypeEnum::TYPE_U2:
-        return static_cast<uint16_t>(lua_tointeger(L, idx));
-    case Il2CppTypeEnum::TYPE_I4:
-        return static_cast<uint32_t>(lua_tointeger(L, idx));
-    case Il2CppTypeEnum::TYPE_U4:
-        return static_cast<uint32_t>(lua_tointeger(L, idx));
-    case Il2CppTypeEnum::TYPE_I8:
-    case Il2CppTypeEnum::TYPE_U8:
-    case Il2CppTypeEnum::TYPE_ENUM:
-        return static_cast<uint64_t>(lua_tointeger(L, idx));
-    case Il2CppTypeEnum::TYPE_I:
-    case Il2CppTypeEnum::TYPE_U:
-        if (lua_islightuserdata(L, idx)) return reinterpret_cast<uint64_t>(lua_touserdata(L, idx));
-        return static_cast<uint64_t>(lua_tointeger(L, idx));
-    case Il2CppTypeEnum::TYPE_STRING:
+        lua_pop(L, 1);
+        return false;
+    }
+    if (e->largeReturn)
     {
-        if (lua_isnil(L, idx)) return 0;
-        const char* str = lua_tostring(L, idx);
-        return str ? reinterpret_cast<uint64_t>(resolver.StringNew(str)) : 0;
+        memcpy(reinterpret_cast<void*>(ctx->rcx), value, size);
+        ctx->resultInt = ctx->rcx;
     }
-    case Il2CppTypeEnum::TYPE_CLASS:
-    case Il2CppTypeEnum::TYPE_OBJECT:
-    case Il2CppTypeEnum::TYPE_SZARRAY:
-    case Il2CppTypeEnum::TYPE_ARRAY:
-    case Il2CppTypeEnum::TYPE_GENERICINST:
-    {
-        if (lua_isnil(L, idx)) return 0;
-        LuaInstanceUD* ud = LuaBridge_CheckInstance(L, idx);
-        return ud ? reinterpret_cast<uint64_t>(ud->obj) : 0;
-    }
-    case Il2CppTypeEnum::TYPE_PTR:
-    case Il2CppTypeEnum::TYPE_FNPTR:
-        if (lua_islightuserdata(L, idx)) return reinterpret_cast<uint64_t>(lua_touserdata(L, idx));
-        return static_cast<uint64_t>(lua_tointeger(L, idx));
-    case Il2CppTypeEnum::TYPE_VALUETYPE:
-    {
-        // 大结构体: 写回调用者提供的隐藏返回缓冲区 返回值指向缓冲区
-        if (e->largeReturn)
-        {
-            void* buffer = reinterpret_cast<void*>(ctx->rcx);
-            if (buffer == nullptr) return 0;
-
-            if (lua_islightuserdata(L, idx))
-            {
-                memcpy(buffer, lua_touserdata(L, idx), static_cast<size_t>(e->returnSize));
-            }
-            else if (!lua_isnil(L, idx))
-            {
-                LuaInstanceUD* ud = LuaBridge_CheckInstance(L, idx);
-                if (ud != nullptr && ud->obj != nullptr)
-                {
-                    void* data = resolver.Unbox(ud->obj);
-                    if (data != nullptr) memcpy(buffer, data, static_cast<size_t>(e->returnSize));
-                    else memset(buffer, 0, static_cast<size_t>(e->returnSize));
-                }
-                else
-                {
-                    memset(buffer, 0, static_cast<size_t>(e->returnSize));
-                }
-            }
-            else
-            {
-                memset(buffer, 0, static_cast<size_t>(e->returnSize));
-            }
-            return reinterpret_cast<uint64_t>(buffer);
-        }
-
-        // 小结构体: 返回位复制到 RAX
-        uint64_t bits = 0;
-        if (!lua_isnil(L, idx))
-        {
-            if (lua_islightuserdata(L, idx))
-            {
-                const void* data = lua_touserdata(L, idx);
-                memcpy(&bits, data, static_cast<size_t>(e->returnSize));
-            }
-            else
-            {
-                LuaInstanceUD* ud = LuaBridge_CheckInstance(L, idx);
-                if (ud != nullptr && ud->obj != nullptr)
-                {
-                    void* data = resolver.Unbox(ud->obj);
-                    if (data != nullptr) memcpy(&bits, data, static_cast<size_t>(e->returnSize));
-                }
-            }
-        }
-        return bits;
-    }
-    default:
-        return static_cast<uint64_t>(lua_tointeger(L, idx));
-    }
+    else if (LuaBridge_IsRefType(e->returnType)) ctx->resultInt = reinterpret_cast<uint64_t>(value);
+    else if (e->returnEnum == Il2CppTypeEnum::TYPE_R4 || e->returnEnum == Il2CppTypeEnum::TYPE_R8)
+        memcpy(&ctx->resultFloat, value, size);
+    else memcpy(&ctx->resultInt, value, size);
+    lua_pop(L, 1);
+    return true;
 }
-
-// 把 Lua 回调返回值写入 ctx
-static void MarshalLuaReturn(lua_State* L, const HookEntry* e, NativeHookContext* ctx, int idx)
-{
-    if (!e->hasReturn) return;
-
-    // 浮点返回值写 XMM0
-    if (e->returnEnum == Il2CppTypeEnum::TYPE_R4 || e->returnEnum == Il2CppTypeEnum::TYPE_R8)
-    {
-        double value = lua_tonumber(L, idx);
-        if (e->returnEnum == Il2CppTypeEnum::TYPE_R4)
-        {
-            float f = static_cast<float>(value);
-            memcpy(&ctx->resultFloat, &f, sizeof(float));
-        }
-        else
-        {
-            memcpy(&ctx->resultFloat, &value, sizeof(double));
-        }
-        return;
-    }
-
-    ctx->resultInt = MarshalReturnInt(L, e, ctx, idx);
-}
-
-// ============================================================
 // Lua 回调调用
-// ============================================================
 // 调用前必须已持有 LuaEngine 互斥锁（可重入）
-// 返回 false 时调用方应回跳原始函数
+// 返回 false 表示尚未执行原方法，需要 fallback；已执行 original 的错误路径复用结果。
 static bool InvokePinnedCallback(lua_State* L, const HookEntry* e, int pinRef, NativeHookContext* ctx)
 {
+    const int base = lua_gettop(L);
+    if (!lua_checkstack(L, e->paramCount + 12)) return false;
+
     // 压入回调函数
     lua_rawgeti(L, LUA_REGISTRYINDEX, pinRef);
 
@@ -990,10 +562,10 @@ static bool InvokePinnedCallback(lua_State* L, const HookEntry* e, int pinRef, N
         lua_newuserdata(L, sizeof(OriginalCallState)));
     memset(st, 0, sizeof(*st));
     st->active = true;
-    st->e = e;
     st->ctx = ctx;
-    // 快照原始参数槽位 供无参 original() 透传
-    SnapshotOriginalArgs(st, ctx, e);
+    // 固定在回调栈下面，用户清空 original 参数并 collectgarbage 也不会回收状态。
+    lua_pushvalue(L, -1);
+    lua_insert(L, base + 1);
 
     // 闭包 upvalue: 1 = HookEntry*, 2 = 本次调用的状态
     lua_pushlightuserdata(L, const_cast<HookEntry*>(e));
@@ -1013,7 +585,10 @@ static bool InvokePinnedCallback(lua_State* L, const HookEntry* e, int pinRef, N
     // 调用 Lua 回调: function(this, original, ...参数) -> 返回值
     int nargs = 2 + e->paramCount;
     int nresults = e->hasReturn ? 1 : 0;
+    LuaEngine::OutputCapture outputCapture;
+    LuaEngine::Instance().BeginOutputCapture(outputCapture);
     int status = lua_pcall(L, nargs, nresults, 0);
+    LuaEngine::Instance().EndOutputCapture(outputCapture);
 
     // 回调结束后 original 闭包失效
     // （闭包若被保存到全局 之后调用会得到明确报错而不是访问悬空指针）
@@ -1021,123 +596,155 @@ static bool InvokePinnedCallback(lua_State* L, const HookEntry* e, int pinRef, N
 
     if (status != LUA_OK)
     {
-        // Lua 回调出错: 记录错误并回跳原始函数
+        // Lua 回调出错：记录错误并请求 C++ 回退到原方法。
         const char* err = lua_tostring(L, -1);
         char buf[512];
         snprintf(buf, sizeof(buf), "[hook] callback error: %s", err ? err : "(non-string error)");
         PipeChannel::Instance().SendLog(buf);
-        lua_pop(L, 1);
-        return false;
+        lua_settop(L, base);
+        return (ctx->reserved & 4) != 0;
     }
 
     // 读取返回值
     if (e->hasReturn)
     {
-        MarshalLuaReturn(L, e, ctx, -1);
+        if (!MarshalLuaReturn(L, e, ctx, -1))
+        {
+            PipeChannel::Instance().SendLog(
+                "[hook] callback returned a value incompatible with the hooked method");
+            lua_settop(L, base);
+            return (ctx->reserved & 4) != 0;
+        }
         lua_pop(L, 1);
     }
 
+    lua_settop(L, base);
     return true;
 }
-
-// ============================================================
 // 分发器（SEH 安全壳）
-// ============================================================
 // HookDetourEntry 汇编跳板调用此函数
 // __try/__except 捕获参数编组/回调过程中的访问违例
-// 任何异常都保持 ctx->original 非空 由汇编跳板回跳原始函数
+// 任何异常都在 C++ 中安全回退到 trampoline；汇编跳板只返回已编组的结果。
 extern "C" void HookDispatch(NativeHookContext* ctx)
 {
+    if (ctx == nullptr) return;
+
+    // 这些字段必须在进入 __try 前初始化，因为异常处理器也会读取它们。
+    // original 只作为当前上下文的回退标志；汇编不会直接调用该地址。
+    ctx->reserved = 0;
+    ctx->original = LookupOriginal(ctx->hookId);
+
     __try
     {
         DispatchSafe(ctx);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        // 恢复在途回调计数与 Lua 互斥锁（/EHsc 下 SEH 不会展开 RAII）
-        // ctx->hasResult / ctx->reserved 由 DispatchSafe 在进入危险区前写入
-        if (ctx->hasResult != 0)
+        // SEH 不会执行 OutputCapture 的 C++ 清理；先清掉线程本地捕获指针，
+        // 避免后续 Hook 输出访问已经离开作用域的批次缓冲区。
+        LuaEngine::Instance().AbortOutputCapture();
+
+        // 恢复显式锁（SEH 不会替 C++ 执行 RAII 析构）。完整 detour
+        // 计数由汇编入口维护，因此异常路径也不会绕过卸载等待。
+        if ((ctx->reserved & 0x2) != 0)
         {
-            g_activeCallbacks.fetch_sub(1);
-            ctx->hasResult = 0;
+            // DispatchSafe 可能在 registry lock 内发生访问违例。
+            g_mutex.unlock();
+            ctx->reserved &= ~0x2;
         }
-        if (ctx->reserved != 0)
+        if ((ctx->reserved & 0x1) != 0)
         {
             LuaEngine::Instance().GetMutex().unlock();
-            ctx->reserved = 0;
+            ctx->reserved &= ~0x1;
         }
-        // ctx->original 已在 DispatchSafe 中预设为原始 trampoline
-        // 保持非空即可安全回跳 不再做任何 Lua 操作
+        // 不把仍在 detour 栈帧中的 trampoline 交给汇编直接调用。即使异常发生在
+        // 参数编组阶段，也尝试通过 trampoline 回退；失败时返回默认值。
+        HookEntry* entry = LookupEntry(ctx->hookId);
+        if (!g_shutdown.load(std::memory_order_acquire))
+            InvokeOriginalFallback(entry, ctx);
+        ctx->original = nullptr;
         PipeChannel::Instance().SendLog("[hook] access violation in hook dispatcher\n");
     }
 }
 
 // 实际分发逻辑（不能在 __try 函数中出现需要展开的 C++ 对象）
+// 原方法回退统一由 NativeInvoke 完成，避免与当前 detour 栈帧重叠。
 static void DispatchSafe(NativeHookContext* ctx)
 {
-    // 异常恢复标志（供 HookDispatch 的 __except 使用）
-    ctx->hasResult = 0;
+    // 异常恢复标志（供 HookDispatch 的 __except 使用）。bit 0 表示 Lua
+    // 锁，bit 1 表示 registry 锁；两把锁都使用显式路径管理。
     ctx->reserved = 0;
 
-    HookEntry* e = nullptr;
+    HookEntry* e = LookupEntry(ctx->hookId);
     int pinRef = LUA_REFNIL;
     bool ok = false;
     bool isTick = false;
 
     auto& engine = LuaEngine::Instance();
-    lua_State* L = engine.GetState();
-    if (L == nullptr) return;
+    if (g_shutdown.load(std::memory_order_acquire))
+    {
+        // Shutdown 只会在完整 detour 计数归零后释放条目；当前调用仍可在
+        // 不触碰 Lua 的情况下执行原方法，避免卸载窗口返回错误的默认值。
+        e = LookupEntry(ctx->hookId);
+        if (e != nullptr && ctx->original != nullptr)
+            InvokeOriginalFallback(e, ctx);
+        ctx->original = nullptr;
+        return;
+    }
 
     // 附加当前线程到 IL2CPP 运行时
     // 回调线程可能从未 attach 过 调用 IL2CPP API 前必须附加
-    Il2CppResolver::Instance().AttachThread();
+    if (Il2CppResolver::Instance().AttachThread() == nullptr)
+    {
+        InvokeOriginalFallback(e, ctx);
+        ctx->original = nullptr;
+        return;
+    }
 
     // 锁顺序固定: Lua 互斥锁 -> Hook 注册表
     // LuaEngine 使用可重入互斥锁 回调内再次触发 Hook 不会死锁
     // 手动加锁/解锁 保证 SEH 异常时可以在 __except 中恢复
     engine.GetMutex().lock();
-    ctx->reserved = 1;
-    if (!engine.IsInitialized()) goto cleanup;
+    ctx->reserved |= 0x1;
+    lua_State* L = engine.GetState();
+    if (L == nullptr || !engine.IsInitialized()) goto cleanup;
 
+    g_mutex.lock();
+    ctx->reserved |= 0x2;
+
+    if (ctx->hookId >= g_entries.size()) goto cleanup;
+    e = g_entries[ctx->hookId].get();
+    if (e == nullptr) goto cleanup;
+
+    // 记录当前条目状态；汇编不再直接调用 trampoline。
+    ctx->original = e->original;
+
+    // 关闭中/未启用 -> 由 cleanup 在 C++ 中回退原方法。
+    if (g_shutdown.load(std::memory_order_acquire) || !e->enabled) goto cleanup;
+
+    // tick 身份可以与用户 Hook 共存。没有用户回调时只排空调度队列；
+    // 有回调时继续 pin 并执行回调，随后再排空队列。
+    isTick = e->isInternalTick;
+    if (isTick && e->luaRef == LUA_REFNIL)
     {
-        std::lock_guard<std::mutex> hookLock(g_mutex);
-
-        if (ctx->hookId >= g_entries.size()) goto cleanup;
-        e = g_entries[ctx->hookId].get();
-        if (e == nullptr) goto cleanup;
-
-        // 预设原始 trampoline 回调失败/异常时回跳
-        ctx->original = e->original;
-
-        // 关闭中/未启用 -> 直接回跳原始函数
-        if (g_shutdown.load() || !e->enabled) goto cleanup;
-
-        // tick 身份可以与用户 Hook 共存。没有用户回调时只排空调度队列；
-        // 有回调时继续 pin 并执行回调，随后再排空队列。
-        isTick = e->isInternalTick;
-        if (isTick && e->luaRef == LUA_REFNIL)
-        {
-            g_activeCallbacks.fetch_add(1);
-            ctx->hasResult = 1;
-            goto unlocked;
-        }
-
-        if (e->luaRef == LUA_REFNIL) goto cleanup;
-
-        // 在锁内 pin 一份回调引用
-        // 防止回调执行期间被 Lua 层 unhook 释放导致悬空
-        lua_rawgeti(L, LUA_REGISTRYINDEX, e->luaRef);
-        if (!lua_isfunction(L, -1))
-        {
-            lua_pop(L, 1);
-            goto cleanup;
-        }
-        pinRef = luaL_ref(L, LUA_REGISTRYINDEX);
-
-        // 计入在途回调 供 Shutdown 等待
-        g_activeCallbacks.fetch_add(1);
-        ctx->hasResult = 1;
+        g_mutex.unlock();
+        ctx->reserved &= ~0x2;
+        goto unlocked;
     }
+
+    if (e->luaRef == LUA_REFNIL) goto cleanup;
+
+    // 在锁内 pin 一份回调引用，防止回调执行期间被 Lua 层 unhook 释放。
+    lua_rawgeti(L, LUA_REGISTRYINDEX, e->luaRef);
+    if (!lua_isfunction(L, -1))
+    {
+        lua_pop(L, 1);
+        goto cleanup;
+    }
+    pinRef = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    g_mutex.unlock();
+    ctx->reserved &= ~0x2;
 
 unlocked:
     if (pinRef != LUA_REFNIL)
@@ -1147,29 +754,44 @@ unlocked:
         if (ok) ctx->original = nullptr;
     }
 
+    if (ctx->original != nullptr)
+    {
+        // 回调报错、返回值不兼容或仅有内部 tick 时，在当前 C++ 栈内
+        // 调用原方法并把结果写回上下文。
+        InvokeOriginalFallback(e, ctx);
+        ctx->original = nullptr;
+    }
+
     // Scheduler 负责确认当前线程并排空队列。用户回调与 tick 共存时，
     // 先完成当前方法回调，再执行排队的主线程任务。
     if (isTick) Il2CppScheduler::Drain(L);
 
     // 释放 pin 引用
     if (pinRef != LUA_REFNIL) luaL_unref(L, LUA_REGISTRYINDEX, pinRef);
-    g_activeCallbacks.fetch_sub(1);
-    ctx->hasResult = 0;
 
 cleanup:
-    if (ctx->reserved != 0)
+    if ((ctx->reserved & 0x2) != 0)
+    {
+        g_mutex.unlock();
+        ctx->reserved &= ~0x2;
+    }
+    if ((ctx->reserved & 0x1) != 0)
     {
         engine.GetMutex().unlock();
-        ctx->reserved = 0;
+        ctx->reserved &= ~0x1;
     }
-}
 
-// ============================================================
+    if (e != nullptr && ctx->original != nullptr)
+    {
+        InvokeOriginalFallback(e, ctx);
+    }
+    ctx->original = nullptr;
+}
 // 公共 API：安装 Hook
-// ============================================================
 bool Il2CppHook::HookMethod(lua_State* L, const Il2CppMethod* method, Il2CppClass* klass, int callbackIdx)
 {
-    if (L == nullptr || method == nullptr) return false;
+    if (L == nullptr || method == nullptr
+        || g_shutdown.load(std::memory_order_acquire)) return false;
 
     auto& resolver = Il2CppResolver::Instance();
 
@@ -1178,26 +800,28 @@ bool Il2CppHook::HookMethod(lua_State* L, const Il2CppMethod* method, Il2CppClas
     int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
     std::lock_guard<std::mutex> lock(g_mutex);
+    // 初始检查与获取注册表锁之间可能发生 Shutdown；必须在锁内再次
+    // 确认，否则清理完成后本次调用仍可能重新初始化 MinHook。
+    if (g_shutdown.load(std::memory_order_acquire))
+    {
+        luaL_unref(L, LUA_REGISTRYINDEX, ref);
+        return false;
+    }
 
     // 已存在条目 -> 替换回调并重新启用
     auto it = g_index.find(method);
     if (it != g_index.end())
     {
         HookEntry* e = g_entries[it->second].get();
+        const MH_STATUS status = MH_EnableHook(e->target);
+        if (status != MH_OK && status != MH_ERROR_ENABLED)
+        {
+            luaL_unref(L, LUA_REGISTRYINDEX, ref);
+            return false;
+        }
         if (e->luaRef != LUA_REFNIL) luaL_unref(L, LUA_REGISTRYINDEX, e->luaRef);
         e->luaRef = ref;
         e->enabled = true;
-        if (e->target != nullptr)
-        {
-            MH_STATUS status = MH_EnableHook(e->target);
-            if (status != MH_OK && status != MH_ERROR_ENABLED)
-            {
-                e->enabled = false;
-                e->luaRef = LUA_REFNIL;
-                luaL_unref(L, LUA_REGISTRYINDEX, ref);
-                return false;
-            }
-        }
         return true;
     }
 
@@ -1216,148 +840,43 @@ bool Il2CppHook::HookMethod(lua_State* L, const Il2CppMethod* method, Il2CppClas
         return false;
     }
 
+    // 调度器可能已经为同一个 Method 安装了内部 tick。此时不能再次向
+    // MinHook 创建同一地址的 Hook，而应复用原条目；保留 isInternalTick
+    // 才能让 unhook 只移除用户回调而不破坏调度器。
+    for (uint32_t i = 0; i < g_entries.size(); ++i)
+    {
+        HookEntry* existing = g_entries[i].get();
+        if (existing == nullptr || existing->target != target) continue;
+        if (existing->method != method)
+        {
+            // 不同 MethodInfo 共享一个 methodPointer 时，参数元数据可能
+            // 不同；单个 detour 无法同时安全表示两套签名，明确拒绝。
+            luaL_unref(L, LUA_REGISTRYINDEX, ref);
+            return false;
+        }
+
+        const MH_STATUS enableStatus = MH_EnableHook(target);
+        if (enableStatus != MH_OK && enableStatus != MH_ERROR_ENABLED)
+        {
+            luaL_unref(L, LUA_REGISTRYINDEX, ref);
+            return false;
+        }
+        if (existing->luaRef != LUA_REFNIL)
+            luaL_unref(L, LUA_REGISTRYINDEX, existing->luaRef);
+        existing->luaRef = ref;
+        existing->enabled = true;
+        g_index[method] = i;
+        return true;
+    }
+
     // 构建条目并填充元数据
     auto entry = std::make_unique<HookEntry>();
     entry->hookId = static_cast<uint32_t>(g_entries.size());
     entry->target = target;
-    entry->method = method;
-    entry->klass = resolver.GetMethodClass(method);
-    if (entry->klass == nullptr) entry->klass = klass;
-    entry->isStatic = resolver.IsStaticMethod(method);
-
-    // 声明类是否为值类型（决定 this 指针解读方式）
-    const Il2CppType* classType = entry->klass ? resolver.GetClassType(entry->klass) : nullptr;
-    if (classType != nullptr)
+    if (!PopulateHookMetadata(entry.get(), method, klass))
     {
-        int32_t classEnum = resolver.GetTypeEnum(classType);
-        entry->isValueTypeClass = (classEnum == Il2CppTypeEnum::TYPE_VALUETYPE
-            || classEnum == Il2CppTypeEnum::TYPE_ENUM);
-    }
-
-    // 缓存参数类型
-    entry->paramCount = resolver.GetMethodParamCount(method);
-    if (entry->paramCount < 0) entry->paramCount = 0;
-    entry->params.reserve(static_cast<size_t>(entry->paramCount));
-
-    for (int32_t i = 0; i < entry->paramCount; ++i)
-    {
-        const Il2CppType* paramType = resolver.GetMethodParamType(method, i);
-        if (paramType == nullptr)
-        {
-            luaL_unref(L, LUA_REGISTRYINDEX, ref);
-            return false;
-        }
-
-        HookParam p;
-        p.typeEnum = resolver.GetTypeEnum(paramType);
-        p.type = paramType;
-
-        if (p.typeEnum == Il2CppTypeEnum::TYPE_BYREF)
-        {
-            // ref/out 参数: 槽位是指针 需要知道目标类型
-            p.isByRef = true;
-            Il2CppClass* targetClass = resolver.GetClassFromType(paramType);
-            if (targetClass != nullptr)
-            {
-                const Il2CppType* targetType = resolver.GetClassType(targetClass);
-                int32_t targetEnum = targetType ? resolver.GetTypeEnum(targetType) : 0;
-                if (targetEnum == Il2CppTypeEnum::TYPE_VALUETYPE
-                    || targetEnum == Il2CppTypeEnum::TYPE_ENUM)
-                {
-                    p.isValueType = true;
-                    p.klass = targetClass;
-                    uint32_t align = 0;
-                    p.valueSize = resolver.ClassValueSize(targetClass, &align);
-                    if (p.valueSize <= 0)
-                    {
-                        luaL_unref(L, LUA_REGISTRYINDEX, ref);
-                        return false;
-                    }
-                }
-                else
-                {
-                    p.klass = targetClass;
-                }
-            }
-        }
-        else if (p.typeEnum == Il2CppTypeEnum::TYPE_VALUETYPE
-            || p.typeEnum == Il2CppTypeEnum::TYPE_GENERICINST)
-        {
-            // 值类型 / 泛型实例: 判断实际是值类型还是引用类型
-            Il2CppClass* valueClass = resolver.GetClassFromType(paramType);
-            const Il2CppType* valueType = valueClass ? resolver.GetClassType(valueClass) : nullptr;
-            int32_t valueEnum = valueType ? resolver.GetTypeEnum(valueType) : 0;
-            if (valueEnum == Il2CppTypeEnum::TYPE_VALUETYPE)
-            {
-                p.isValueType = true;
-                p.klass = valueClass;
-                uint32_t align = 0;
-                p.valueSize = resolver.ClassValueSize(valueClass, &align);
-                if (p.valueSize <= 0)
-                {
-                    luaL_unref(L, LUA_REGISTRYINDEX, ref);
-                    return false;
-                }
-            }
-            else
-            {
-                // 引用类型泛型（如 List<T>）按引用对象处理
-                p.klass = valueClass;
-            }
-        }
-        else if (p.typeEnum == Il2CppTypeEnum::TYPE_CLASS
-            || p.typeEnum == Il2CppTypeEnum::TYPE_OBJECT
-            || p.typeEnum == Il2CppTypeEnum::TYPE_SZARRAY
-            || p.typeEnum == Il2CppTypeEnum::TYPE_ARRAY)
-        {
-            p.klass = resolver.GetClassFromType(paramType);
-        }
-
-        entry->params.push_back(p);
-    }
-
-    // 缓存返回值信息
-    const Il2CppType* retType = resolver.GetMethodReturnType(method);
-    entry->returnType = retType;
-    entry->returnEnum = retType ? resolver.GetTypeEnum(retType) : Il2CppTypeEnum::TYPE_VOID;
-    entry->hasReturn = (entry->returnEnum != Il2CppTypeEnum::TYPE_VOID);
-
-    // 泛型值类型返回值统一按值类型处理
-    if (entry->returnEnum == Il2CppTypeEnum::TYPE_GENERICINST)
-    {
-        Il2CppClass* retClass = resolver.GetClassFromType(retType);
-        const Il2CppType* retTypeInfo = retClass ? resolver.GetClassType(retClass) : nullptr;
-        int32_t retEnum = retTypeInfo ? resolver.GetTypeEnum(retTypeInfo) : 0;
-        if (retEnum == Il2CppTypeEnum::TYPE_VALUETYPE)
-        {
-            entry->returnEnum = Il2CppTypeEnum::TYPE_VALUETYPE;
-            entry->returnClass = retClass;
-            uint32_t align = 0;
-            entry->returnSize = resolver.ClassValueSize(retClass, &align);
-            if (entry->returnSize <= 0)
-            {
-                luaL_unref(L, LUA_REGISTRYINDEX, ref);
-                return false;
-            }
-            entry->largeReturn = !HookIsRegisterStruct(entry->returnSize);
-        }
-    }
-    else if (entry->returnEnum == Il2CppTypeEnum::TYPE_VALUETYPE)
-    {
-        entry->returnClass = resolver.GetClassFromType(retType);
-        if (entry->returnClass == nullptr)
-        {
-            luaL_unref(L, LUA_REGISTRYINDEX, ref);
-            return false;
-        }
-        uint32_t align = 0;
-        entry->returnSize = resolver.ClassValueSize(entry->returnClass, &align);
-        if (entry->returnSize <= 0)
-        {
-            luaL_unref(L, LUA_REGISTRYINDEX, ref);
-            return false;
-        }
-        entry->largeReturn = !HookIsRegisterStruct(entry->returnSize);
+        luaL_unref(L, LUA_REGISTRYINDEX, ref);
+        return false;
     }
 
     // 分配 thunk 并创建 MinHook
@@ -1392,10 +911,7 @@ bool Il2CppHook::HookMethod(lua_State* L, const Il2CppMethod* method, Il2CppClas
     g_index[method] = static_cast<uint32_t>(g_entries.size() - 1);
     return true;
 }
-
-// ============================================================
 // 公共 API：卸载 Hook
-// ============================================================
 bool Il2CppHook::UnhookMethod(const Il2CppMethod* method)
 {
     if (method == nullptr) return false;
@@ -1424,10 +940,7 @@ bool Il2CppHook::UnhookMethod(const Il2CppMethod* method)
     e->luaRef = LUA_REFNIL;
     return true;
 }
-
-// ============================================================
 // 公共 API：查询 / 批量卸载
-// ============================================================
 bool Il2CppHook::IsHooked(const Il2CppMethod* method)
 {
     if (method == nullptr) return false;
@@ -1460,34 +973,26 @@ void Il2CppHook::UnhookAll()
         entry->luaRef = LUA_REFNIL;
     }
 }
-
-// ============================================================
 // Scheduler 使用的内部 tick Hook 后端
-// ============================================================
 bool Il2CppHook::InstallSchedulerTick(const Il2CppMethod* method, Il2CppClass* klass)
 {
     if (method == nullptr) return false;
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_shutdown.load(std::memory_order_acquire)) return false;
 
-    // 移除旧条目的 tick 身份。若它还承载用户 Hook，则继续保持启用；
-    // 否则只禁用底层 Hook，并保留条目和 trampoline 供后续复用。
-    if (g_tickHookId != UINT32_MAX && g_tickHookId < g_entries.size())
+    const uint32_t oldId = g_tickHookId;
+    if (!TryInstallTickHook(method, klass)) return false;
+    if (oldId != g_tickHookId && oldId < g_entries.size())
     {
-        HookEntry* old = g_entries[g_tickHookId].get();
-        if (old != nullptr)
+        HookEntry* old = g_entries[oldId].get();
+        old->isInternalTick = false;
+        if (old->luaRef == LUA_REFNIL)
         {
-            old->isInternalTick = false;
-            if (old->luaRef == LUA_REFNIL)
-            {
-                old->enabled = false;
-                if (old->target != nullptr) MH_DisableHook(old->target);
-            }
+            old->enabled = false;
+            MH_DisableHook(old->target);
         }
     }
-    g_tickHookId = UINT32_MAX;
-    g_tickInstalled = false;
-
-    return TryInstallTickHook(method, klass);
+    return true;
 }
 
 bool Il2CppHook::IsSchedulerTickInstalled()
@@ -1495,10 +1000,7 @@ bool Il2CppHook::IsSchedulerTickInstalled()
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_tickInstalled;
 }
-
-// ============================================================
 // 公共 API：关闭模块
-// ============================================================
 void Il2CppHook::Shutdown()
 {
     lua_State* L = LuaEngine::Instance().GetState();
@@ -1515,9 +1017,10 @@ void Il2CppHook::Shutdown()
         }
     }
 
-    // 等待在途回调全部结束（回调计数在 g_mutex 内增减）
+    // 等待完整 detour 全部结束。计数覆盖汇编入口、Lua 分发和原方法回退，
+    // 因此条目与 MinHook 资源不会在仍有线程执行时被释放。
     std::unique_lock<std::mutex> lock(g_mutex);
-    while (g_activeCallbacks.load(std::memory_order_acquire) != 0)
+    while (g_activeDetours.load(std::memory_order_acquire) != 0)
     {
         lock.unlock();
         Sleep(10);

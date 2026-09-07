@@ -1,18 +1,11 @@
 /**
- * ============================================================
  * lua_binding_assembly.cpp — Assembly userdata 绑定
- * ============================================================
  * Assembly 是程序集范围反射的入口：可以读取程序集名、精确查找类，
  * 或在导出支持时枚举程序集中的全部类。所有返回对象均通过统一的
  * userdata 创建函数压栈，空运行时指针统一映射为 Lua nil。
- * ============================================================
  */
 #include "lua_binding_internal.h"
-
-// ============================================================
 // Assembly 元表方法
-// ============================================================
-
 // assembly:get_name() → string | nil
 // 名称直接来自 Il2CppAssembly 对应的 Il2CppImage 元数据。
 static int Assembly_GetName(lua_State* L)
@@ -23,7 +16,6 @@ static int Assembly_GetName(lua_State* L)
     else lua_pushnil(L);
     return 1;
 }
-
 // assembly:get_class(namespace, name) → Class | nil
 // 只在当前程序集内查找，不回退到全程序集搜索。
 static int Assembly_GetClass(lua_State* L)
@@ -42,7 +34,7 @@ static int Assembly_GetClasses(lua_State* L)
     LuaAssemblyUD* ud = static_cast<LuaAssemblyUD*>(luaL_checkudata(L, 1, LuaBridgeMT::ASSEMBLY));
     auto& resolver = Il2CppResolver::Instance();
     const int32_t count = resolver.GetAssemblyClassCount(ud->assembly);
-    if (count < 0) return luaL_error(L, "assembly class enumeration is unavailable");
+    if (count < 0) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "assembly class enumeration is unavailable");
 
     lua_createtable(L, count, 0);
     for (int32_t i = 0; i < count; ++i)

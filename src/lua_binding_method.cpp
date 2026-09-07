@@ -1,18 +1,11 @@
 /**
- * ============================================================
  * lua_binding_method.cpp — Method userdata 绑定
- * ============================================================
  * 封装方法元数据、完整签名、显式调用和 Hook 生命周期。签名生成同时供
  * il2cpp.get_tick() 使用，保证 Method 显示与 Scheduler 状态格式一致。
- * ============================================================
  */
 #include "lua_binding_internal.h"
 #include "il2cpp_hook.h"
-
-// ============================================================
 // Method 元表方法
-// ============================================================
-
 // mth:get_name() → string
 static int Method_GetName(lua_State* L)
 {
@@ -22,7 +15,6 @@ static int Method_GetName(lua_State* L)
     lua_pushstring(L, name ? name : "");
     return 1;
 }
-
 // 根据 MethodAttributes 中的成员访问位返回签名使用的访问修饰符。
 static const char* GetMethodAccessModifier(uint32_t flags)
 {
@@ -126,7 +118,7 @@ static int Method_Call(lua_State* L)
     {
         // 实例方法：第一个参数必须是 Instance
         LuaInstanceUD* instUD = LuaBridge_CheckInstance(L, 2);
-        if (instUD == nullptr) return luaL_error(L, "instance method requires Instance as first arg");
+        if (instUD == nullptr) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "instance method requires Instance as first arg");
 
         Il2CppClass* declaringClass = resolver.GetMethodClass(ud->method);
         if (declaringClass == nullptr) declaringClass = ud->klass;
@@ -134,7 +126,7 @@ static int Method_Call(lua_State* L)
         if (instanceClass == nullptr && instUD->obj != nullptr)
             instanceClass = READ_OFFSET(instUD->obj, 0, Il2CppClass*)[0];
         if (!resolver.IsAssignableFrom(declaringClass, instanceClass))
-            return luaL_error(L, "instance type is not compatible with method declaring class");
+            return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "instance type is not compatible with method declaring class");
 
         obj = instUD->obj;
         // 参数从第 3 个位置开始
@@ -143,11 +135,7 @@ static int Method_Call(lua_State* L)
 
     return LuaBridge_InvokeMethod(L, ud->method, obj, argStart);
 }
-
-// ============================================================
 // Method Hook（参考 frida-il2cpp-bridge 的 implementation / revert）
-// ============================================================
-
 // mth:hook(function(this, original, ...) ... end)
 // 替换方法实现 回调签名:
 // ·实例方法: function(this, original, 参数1, ...) ... return 返回值 end
@@ -161,13 +149,13 @@ static int Method_Hook(lua_State* L)
 
     if (lua_type(L, 2) != LUA_TFUNCTION)
     {
-        return luaL_error(L, "hook requires a function");
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "hook requires a function");
     }
 
     if (!Il2CppHook::HookMethod(L, ud->method, ud->klass, 2))
     {
         const char* name = resolver.GetMethodName(ud->method);
-        return luaL_error(L, "failed to hook method: %s", name ? name : "?");
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "failed to hook method: %s", name ? name : "?");
     }
     return 0;
 }
@@ -180,7 +168,7 @@ static int Method_Unhook(lua_State* L)
 
     if (!Il2CppHook::UnhookMethod(ud->method))
     {
-        return luaL_error(L, "method is not hooked");
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "method is not hooked");
     }
     return 0;
 }

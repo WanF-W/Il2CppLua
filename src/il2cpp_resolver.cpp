@@ -1,36 +1,11 @@
-/**
- * ============================================================
- * il2cpp_resolver.cpp — IL2CPP 运行时桥接层实现
- * ============================================================
- * 本文件实现 il2cpp_resolver.h 中声明的 Il2CppResolver 类 
- *
- * 核心职责
- * 
- * ·通过 GetProcAddress 动态解析 GameAssembly.dll 导出的 40+ 个 IL2CPP 运行时函数 获取函数指针
- * ·将这些 C 风格函数指针封装为类型安全的 C++ 方法
- * ·提供 Image 全量缓存和 Class 按需缓存 加速重复查找
- * ·线程安全：所有缓存操作通过 mutex 保护
- *
- * 技术要点
- * 
- * ·GameAssembly.dll 是 Unity IL2CPP 打包后的核心原生库
- * ·IL2CPP 导出函数名以  il2cpp_ 为前缀 可通过 dump 出的头文件 获得完整函数签名
- * ·Windows x64 下所有函数使用默认 __stdcall 或 __cdecl 调用约定
- * ·（实际上 IL2CPP 导出函数使用 C 调用约定 在 x64 下统一为 Microsoft x64 ABI）
- * 
- * 不做跨平台适配 仅 Windows x64
- * ============================================================
- */
-
+// 运行时导出解析、元数据查询和 IL2CPP 原语。此层不依赖 Lua 或 UnityEngine。
+// 导出完整性在 Init 检查；缓存名称由本层拥有，元数据地址由运行时拥有。
 #include "il2cpp_resolver.h"
-#include "pipe_channel.h"
 
-#include <cstdio>
-#include <cstdarg>
-
-// ============================================================
+#include <algorithm>
+#include <cctype>
+#include <windows.h>
 // 单例获取
-// ============================================================
 Il2CppResolver& Il2CppResolver::Instance()
 {
     // C++11 魔法静态 第一次调用时构造 后续直接返回引用
@@ -38,20 +13,21 @@ Il2CppResolver& Il2CppResolver::Instance()
     static Il2CppResolver instance;
     return instance;
 }
-
-// ============================================================
 // 初始化
-// ============================================================
 // 初始化流程
-// 
+//
 // ·解析 GameAssembly.dll 的全部导出函数
 // ·获取 IL2CPP 应用域 (Domain)
 // ·将当前线程 attach 到 IL2CPP 运行时（IL2CPP 要求所有访问托管对象的线程必须先 attach）
 // ·遍历所有程序集 缓存全部 Image（后续 GetClass 查找时使用）
 BridgeResult Il2CppResolver::Init()
 {
-    // 防止重复初始化
     if (m_initialized) return BridgeResult::ERR_ALREADY_INITIALIZED;
+
+    // Init 可能在 GameAssembly 尚未加载时被重复尝试。每次尝试都从干净的
+    // 统计状态开始，否则失败导出名称和计数会跨重试累加，误导诊断信息。
+    m_totalFunctions = 0;
+    m_failedFunctions.clear();
 
     // 解析导出函数
     // 如果关键函数解析失败 整个桥接层无法工作
@@ -65,27 +41,27 @@ BridgeResult Il2CppResolver::Init()
 
     // 调用 il2cpp_thread_attach() 附加到当前 IL2CPP 线程
     // IL2CPP 维护一个线程表 只有 attach 过的线程才能安全调用
-    // IL2CPP API 不 attach 会导致随机崩溃或返回无效数据 
-    if (m_thread_attach != nullptr && m_domain != nullptr) m_thread = m_thread_attach(m_domain);
+    // IL2CPP API 不 attach 会导致随机崩溃或返回无效数据
+    if (m_thread_attach == nullptr || m_domain == nullptr
+        || (m_thread = m_thread_attach(m_domain)) == nullptr)
+    {
+        return BridgeResult::ERR_IL2CPP_RESOLVE_FAILED;
+    }
 
     // 缓存所有 Image
-    // Image 是程序集的元数据容器 一个程序集对应一个 Image 
+    // Image 是程序集的元数据容器 一个程序集对应一个 Image
     // 我们在初始化时一次性获取所有 Image 避免后续每次 GetClass
-    // 都重新枚举程序集（减少开销和临时对象） 
+    // 都重新枚举程序集（减少开销和临时对象）
     CacheAllImages();
 
-    // 标记初始化完成
     m_initialized = true;
     return BridgeResult::OK;
 }
-
-// ============================================================
 // 关闭
-// ============================================================
 void Il2CppResolver::Shutdown()
 {
-    // 如果线程已 attach detach 它
-    // 不 detach 会导致线程退出时 IL2CPP 内部状态不一致
+    // 这里只 detach Init 所在线程。Hook 回调线程的附加状态故意保持到进程
+    // 结束，避免在未知回调生命周期中错误 detach；详见 README 的限制说明。
     if (m_thread_detach != nullptr && m_thread != nullptr)
     {
         // 调用 il2cpp_thread_detach()
@@ -93,13 +69,12 @@ void Il2CppResolver::Shutdown()
         m_thread = nullptr;
     }
 
-    // 清空缓存
     {
-        // 清空缓存
         std::lock_guard<std::mutex> lock(m_mutex);
         m_imageCache.clear();
         m_assemblyCache.clear();
         m_classCache.clear();
+        m_typeNames.clear();
     }
 
     // 清空所有函数指针（防止 Shutdown 后误调用）
@@ -123,8 +98,9 @@ void Il2CppResolver::Shutdown()
     m_class_get_type = nullptr;
     m_class_get_element_class = nullptr;
     m_class_value_size = nullptr;
+    m_method_is_generic = nullptr;
+    m_method_is_inflated = nullptr;
     m_method_get_class = nullptr;
-    m_class_get_method_from_name = nullptr;
     m_class_get_methods = nullptr;
     m_method_get_name = nullptr;
     m_method_get_param_name = nullptr;
@@ -147,32 +123,50 @@ void Il2CppResolver::Shutdown()
     m_object_new = nullptr;
     m_runtime_invoke = nullptr;
     m_runtime_class_init = nullptr;
-    m_string_new = nullptr;
     m_string_new_len = nullptr;
     m_string_chars = nullptr;
     m_string_length = nullptr;
+    m_object_to_string = nullptr;
     m_value_box = nullptr;
     m_object_unbox = nullptr;
     m_type_get_type = nullptr;
     m_type_get_name = nullptr;
     m_class_from_type = nullptr;
     m_type_get_object = nullptr;
+    m_type_is_byref = nullptr;
+    m_free = nullptr;
+    m_gchandle_new = nullptr;
+    m_gchandle_free = nullptr;
+    m_class_has_references = nullptr;
+    m_gc_wbarrier_set_field = nullptr;
     m_array_new = nullptr;
 
     // 重置状态
     m_domain = nullptr;
+    m_totalFunctions = 0;
+    m_failedFunctions.clear();
     m_initialized = false;
 }
 
-// ============================================================
+void Il2CppResolver::DetachInitializationThread()
+{
+    if (m_thread_detach != nullptr && m_thread != nullptr)
+    {
+        m_thread_detach(m_thread);
+        m_thread = nullptr;
+    }
+}
+
+void Il2CppResolver::DetachThread(Il2CppThread* thread) const
+{
+    if (thread != nullptr && m_thread_detach != nullptr)
+        m_thread_detach(thread);
+}
 // 解析 GameAssembly.dll 的全部导出函数
-// ============================================================
 // 使用 GetModuleHandleW 获取已加载的 GameAssembly.dll 模块句柄
 // 然后通过 GetProcAddress 逐个解析每个 IL2CPP 导出函数
 //
-// 返回 true 表示所有关键函数都已成功解析
-// 非关键函数（如 type_get_object、array_new）可能不存在于旧版
-// Unity 中 解析失败不会导致整体失败 但相关功能将不可用
+// 返回 true 表示必需导出均可用；object_to_string 仅增强诊断，不参与硬性检查。
 bool Il2CppResolver::ResolveExports()
 {
     // 获取 GameAssembly.dll 模块句柄
@@ -184,7 +178,7 @@ bool Il2CppResolver::ResolveExports()
 
     // 辅助宏：解析单个导出函数
     // # 将 GetProcAddress 的返回值（FARPROC）转换为正确的函数指针类型
-    // # 并赋值给成员变量 如果函数不存在 指针保持 nullptr 
+    // # 并赋值给成员变量 如果函数不存在 指针保持 nullptr
     #define RESOLVE(name, type) ++m_totalFunctions; \
         m_##name = reinterpret_cast<type>(GetProcAddress(hGameAssembly, "il2cpp_" #name)); \
         if (m_##name == nullptr) m_failedFunctions.push_back("il2cpp_" #name)
@@ -216,8 +210,9 @@ bool Il2CppResolver::ResolveExports()
     RESOLVE(class_value_size, pfn_class_value_size);
 
     // 方法操作
+    RESOLVE(method_is_generic, pfn_method_is_generic);
+    RESOLVE(method_is_inflated, pfn_method_is_inflated);
     RESOLVE(method_get_class, pfn_method_get_class);
-    RESOLVE(class_get_method_from_name, pfn_class_get_method_from_name);
     RESOLVE(class_get_methods, pfn_class_get_methods);
     RESOLVE(method_get_name, pfn_method_get_name);
     RESOLVE(method_get_param_name, pfn_method_get_param_name);
@@ -246,11 +241,14 @@ bool Il2CppResolver::ResolveExports()
     RESOLVE(runtime_class_init, pfn_runtime_class_init);
 
     // 字符串
-    RESOLVE(string_new, pfn_string_new);
     RESOLVE(string_new_len, pfn_string_new_len);
-    RESOLVE(string_new_utf16, pfn_string_new_utf16);
     RESOLVE(string_chars, pfn_string_chars);
     RESOLVE(string_length, pfn_string_length);
+
+    // ToString 只用于增强异常诊断，不作为初始化硬依赖。老版本或裁剪过的
+    // GameAssembly 可能没有这个导出，此时桥接层仍应正常工作并回退到通用文本。
+    m_object_to_string = reinterpret_cast<pfn_object_to_string>(
+        GetProcAddress(hGameAssembly, "il2cpp_object_to_string"));
 
     //  装箱/拆箱
     RESOLVE(value_box, pfn_value_box);
@@ -263,32 +261,21 @@ bool Il2CppResolver::ResolveExports()
     RESOLVE(type_get_object, pfn_type_get_object);
 
     // 数组
+    RESOLVE(type_is_byref, pfn_type_is_byref);
+    RESOLVE(free, pfn_free);
+    RESOLVE(gchandle_new, pfn_gchandle_new);
+    RESOLVE(gchandle_free, pfn_gchandle_free);
+    RESOLVE(class_has_references, pfn_class_has_references);
+    RESOLVE(gc_wbarrier_set_field, pfn_gc_wbarrier_set_field);
     RESOLVE(array_new, pfn_array_new);
 
     // 取消宏定义 避免污染后续代码
     #undef RESOLVE
 
-    // 检查关键函数是否解析成功
-    // 以下函数是桥接层正常工作的最低要求 任何一个缺失都意味着
-    // IL2CPP 运行时无法正常交互
-    if (m_domain_get == nullptr) return false;
-    if (m_domain_get_assemblies == nullptr) return false;
-    if (m_assembly_get_image == nullptr) return false;  
-    if (m_thread_attach == nullptr) return false;
-    if (m_class_from_name == nullptr) return false;
-    if (m_class_get_methods == nullptr) return false;
-    if (m_method_get_name == nullptr) return false;
-    if (m_object_new == nullptr) return false;
-    if (m_runtime_invoke == nullptr) return false;
-
-    // 非关键函数允许为 null（旧版 Unity 可能缺少）
-    // 使用相关功能时会检查并返回错误
-    return true;
+    // 元数据、值转换与 GC API 构成完整契约；缺失时不能假装读写成功。
+    return m_failedFunctions.empty();
 }
-
-// ============================================================
 // 获取解析导出函数的结果
-// ============================================================
 std::string Il2CppResolver::GetResolveStatus() const
 {
     if (m_failedFunctions.empty()) return "All " + std::to_string(m_totalFunctions) + " functions resolved";
@@ -303,12 +290,9 @@ std::string Il2CppResolver::GetResolveStatus() const
 
     return result;
 }
-
-// ============================================================
 // 缓存所有 Image
-// ============================================================
 // 遍历 IL2CPP Domain 下的所有程序集 将每个程序集的 Image 指针
-// 存入 m_imageCache 后续 GetClass 查找时遍历这个缓存即可 
+// 存入 m_imageCache 后续 GetClass 查找时遍历这个缓存即可
 void Il2CppResolver::CacheAllImages()
 {
     // 安全检查：确保所需函数指针已就绪
@@ -336,13 +320,10 @@ void Il2CppResolver::CacheAllImages()
         }
     }
 
-    // 注意：assemblies 指针指向的内存由 IL2CPP 运行时管理 
-    // 我们不需要释放它 但这个指针只在当前线程 attach 状态下有效 
+    // 注意：assemblies 指针指向的内存由 IL2CPP 运行时管理
+    // 我们不需要释放它 但这个指针只在当前线程 attach 状态下有效
 }
-
-// ============================================================
 // 程序集与镜像查询
-// ============================================================
 Il2CppAssembly* Il2CppResolver::GetAssemblyAt(int32_t index) const
 {
     if (index < 0 || static_cast<size_t>(index) >= m_assemblyCache.size()) return nullptr;
@@ -383,8 +364,8 @@ Il2CppAssembly* Il2CppResolver::GetClassAssembly(Il2CppClass* klass) const
     const Il2CppImage* image = m_class_get_image(klass);
     if (image == nullptr) return nullptr;
 
-    // 优先利用初始化时建立的 Assembly/Image 对应缓存，
-    // 旧版 Unity 缺少 image_get_assembly 导出时仍可正常反查。
+    // 优先利用初始化时建立的 Assembly/Image 对应缓存；
+    // 缓存之外的镜像通过 image_get_assembly 查询。
     for (size_t i = 0; i < m_imageCache.size() && i < m_assemblyCache.size(); ++i)
     {
         if (m_imageCache[i] == image) return m_assemblyCache[i];
@@ -422,22 +403,19 @@ Il2CppClass* Il2CppResolver::GetAssemblyClassAt(Il2CppAssembly* assembly, int32_
     if (static_cast<size_t>(index) >= count) return nullptr;
     return m_image_get_class(image, static_cast<size_t>(index));
 }
-
-// ============================================================
 // 按命名空间 + 类名查找类
-// ============================================================
 // 查找策略
-// 
+//
 // ·先查缓存（m_classCache） 命中则直接返回
 // ·未命中则遍历所有缓存的 Image 对每个 Image 调用
 // ·il2cpp_class_from_name 尝试查找
 // ·找到后存入缓存 供下次查询使用
 //
 // 参数
-// 
+//
 // ·namespaze — 命名空间（如 "UnityEngine"、"System"、"" 表示全局）
 // ·className — 类名（如 "Object"、"Transform"）
-// 
+//
 // 返回：Il2CppClass* 指针 未找到返回 nullptr
 Il2CppClass* Il2CppResolver::GetClass(const std::string& namespaze, const std::string& className)
 {
@@ -452,8 +430,8 @@ Il2CppClass* Il2CppResolver::GetClass(const std::string& namespaze, const std::s
     }
 
     // 遍历所有 Image 查找
-    // il2cpp_class_from_name 接受 (Image*, namespace, name) 三个参数 
-    // 在指定 Image 的范围内查找类 我们需要遍历所有 Image 才能找到 
+    // il2cpp_class_from_name 接受 (Image*, namespace, name) 三个参数
+    // 在指定 Image 的范围内查找类 我们需要遍历所有 Image 才能找到
     if (m_class_from_name == nullptr) return nullptr;
 
     Il2CppClass* result = nullptr;
@@ -483,11 +461,7 @@ Il2CppClass* Il2CppResolver::GetClass(const std::string& namespaze, const std::s
 
     return result;
 }
-
-// ============================================================
 // 类信息获取方法
-// ============================================================
-
 // 获取类名（不含命名空间）
 const char* Il2CppResolver::GetClassSimpleName(Il2CppClass* klass) const
 {
@@ -504,7 +478,6 @@ const char* Il2CppResolver::GetClassNamespace(Il2CppClass* klass) const
     return m_class_get_namespace(klass);
 }
 
-// 获取父类
 Il2CppClass* Il2CppResolver::GetClassParent(Il2CppClass* klass) const
 {
     if (klass == nullptr || m_class_get_parent == nullptr) return nullptr;
@@ -527,47 +500,32 @@ const Il2CppType* Il2CppResolver::GetClassType(Il2CppClass* klass) const
 
 bool Il2CppResolver::IsValueType(Il2CppClass* klass) const
 {
-    if (klass == nullptr) return false;
-    if (m_class_is_valuetype != nullptr) return m_class_is_valuetype(klass);
-    const int32_t type = GetTypeEnum(GetClassType(klass));
-    return type == Il2CppTypeEnum::TYPE_VALUETYPE || type == Il2CppTypeEnum::TYPE_ENUM;
+    return klass != nullptr && m_class_is_valuetype != nullptr && m_class_is_valuetype(klass);
 }
 
 bool Il2CppResolver::IsEnum(Il2CppClass* klass) const
 {
-    if (klass == nullptr) return false;
-    if (m_class_is_enum != nullptr) return m_class_is_enum(klass);
-    return GetTypeEnum(GetClassType(klass)) == Il2CppTypeEnum::TYPE_ENUM;
+    return klass != nullptr && m_class_is_enum != nullptr && m_class_is_enum(klass);
 }
-
-// ============================================================
 // 方法查找与信息
-// ============================================================
-
 // 按方法名查找（不限定参数个数） 返回第一个同名方法
-// il2cpp_class_get_method_from_name 需要指定参数个数 
+// il2cpp_class_get_method_from_name 需要指定参数个数
 // 如果指定了错误的个数会返回 nullptr 因此我们通过遍历
-// 所有方法来按名字查找 忽略参数个数 
+// 所有方法来按名字查找 忽略参数个数
 const Il2CppMethod* Il2CppResolver::GetMethod(Il2CppClass* klass, const std::string& name) const
 {
     if (klass == nullptr || m_class_get_methods == nullptr || m_method_get_name == nullptr) return nullptr;
 
-    // 使用迭代器遍历类的所有方法
-    // IL2CPP 的 class_get_methods 使用 void* 迭代器模式
-    // 初始传入 iter = nullptr 每次调用返回下一个方法并更新 iter 
-    // 返回 nullptr 表示遍历结束 
-    void* iter = nullptr;
-    const Il2CppMethod* method = nullptr;
-
-    while ((method = m_class_get_methods(klass, &iter)) != nullptr)
+    for (auto* current = klass; current != nullptr; current = GetClassParent(current))
     {
-        // 获取当前方法名
-        const char* methodName = m_method_get_name(method);
-        // 名字匹配 返回该方法
-        if (methodName != nullptr && name == methodName) return method;
+        void* iter = nullptr;
+        while (const auto* method = m_class_get_methods(current, &iter))
+        {
+            const char* methodName = m_method_get_name(method);
+            if (methodName != nullptr && name == methodName) return method;
+        }
+        if (name == ".ctor" || name == ".cctor") break;
     }
-
-    // 未找到
     return nullptr;
 }
 
@@ -637,24 +595,10 @@ Il2CppClass* Il2CppResolver::GetMethodClass(const Il2CppMethod* method) const
 // 判断 source 实例是否可以作为 target 类型使用
 bool Il2CppResolver::IsAssignableFrom(Il2CppClass* target, Il2CppClass* source) const
 {
-    if (target == nullptr || source == nullptr) return false;
-    if (target == source) return true;
-    if (m_class_is_assignable_from != nullptr) return m_class_is_assignable_from(target, source);
-
-    // 旧版 Unity 缺少导出时，至少沿父类链检查普通类继承关系。
-    Il2CppClass* current = source;
-    while (current != nullptr)
-    {
-        if (current == target) return true;
-        current = GetClassParent(current);
-    }
-    return false;
+    return target != nullptr && source != nullptr && m_class_is_assignable_from != nullptr
+        && m_class_is_assignable_from(target, source);
 }
-
-// ========================================================
 // 线程与原生方法
-// ========================================================
-
 // 将当前线程附加到 IL2CPP 运行时
 // Hook 回调可能发生在任意游戏线程 调用 IL2CPP API 前必须先附加
 // 官方签名: Il2CppThread* il2cpp_thread_attach(Il2CppDomain* domain)
@@ -672,11 +616,7 @@ void* Il2CppResolver::GetMethodPointer(const Il2CppMethod* method) const
     if (method == nullptr) return nullptr;
     return READ_OFFSET(method, METHODINFO_METHODPOINTER_OFFSET, void*)[0];
 }
-
-// ============================================================
 // 字段查找与信息
-// ============================================================
-
 // 按字段名查找
 const Il2CppField* Il2CppResolver::GetField(Il2CppClass* klass, const std::string& name) const
 {
@@ -725,14 +665,10 @@ bool Il2CppResolver::IsStaticField(const Il2CppField* field) const
     constexpr uint32_t FIELD_ATTRIBUTE_STATIC = 0x0010;
     return (GetFieldFlags(field) & FIELD_ATTRIBUTE_STATIC) != 0;
 }
-
-// ============================================================
 // 字段读写
-// ============================================================
-
 // 读取实例字段值
 // 将 obj 对象中 field 对应的字段值复制到 outValue 指向的缓冲区
-// outValue 缓冲区大小必须足够容纳字段值（至少 sizeof(void*) 字节）
+// outValue 缓冲区大小必须足够容纳字段的实际值，大小由调用方按类型确定。
 void Il2CppResolver::ReadField(Il2CppObject* obj, const Il2CppField* field, void* outValue) const
 {
     if (obj == nullptr || field == nullptr || outValue == nullptr || m_field_get_value == nullptr) return;
@@ -743,7 +679,7 @@ void Il2CppResolver::ReadField(Il2CppObject* obj, const Il2CppField* field, void
 // 写入实例字段值
 void Il2CppResolver::WriteField(Il2CppObject* obj, const Il2CppField* field, void* value) const
 {
-    if (obj == nullptr || field == nullptr || value == nullptr || m_field_set_value == nullptr) return;
+    if (obj == nullptr || field == nullptr || m_field_set_value == nullptr) return;
     m_field_set_value(obj, field, value);
 }
 
@@ -758,15 +694,10 @@ void Il2CppResolver::ReadStaticField(const Il2CppField* field, void* outValue) c
 // 写入静态字段值
 void Il2CppResolver::WriteStaticField(const Il2CppField* field, void* value) const
 {
-    if (field == nullptr || value == nullptr || m_field_static_set_value == nullptr) return;
+    if (field == nullptr || m_field_static_set_value == nullptr) return;
     m_field_static_set_value(field, value);
 }
-
-// ============================================================
 // 运行时调用
-// ============================================================
-
-// 创建对象（分配内存 不调用构造函数）
 // 返回的指针对象已初始化 klass 头部 但字段值未初始化
 // 如需完整构造 应通过 RuntimeInvoke 调用 .ctor 方法
 Il2CppObject* Il2CppResolver::ObjectNew(Il2CppClass* klass) const
@@ -777,17 +708,17 @@ Il2CppObject* Il2CppResolver::ObjectNew(Il2CppClass* klass) const
 
 // 通过 runtime_invoke 调用方法 这是 IL2CPP 提供的安全调用方式
 //
-// ·自动处理虚方法分派
-// ·自动装箱/拆箱参数
+// ·调用指定 MethodInfo；调用方负责选择虚方法和拆箱值类型 this
+// ·值参数传存储地址，引用参数传对象本身
 // ·捕获 C# 异常到 outExc
 //
 // 参数
-// 
+//
 // ·method  — 要调用的方法
 // ·obj     — this 指针（静态方法传 nullptr）
 // ·params  — 参数指针数组 每个元素指向一个参数值
 // ·outExc  — [out] 接收异常对象指针 无异常时为 nullptr
-// 
+//
 // 返回：方法的返回值（装箱后的托管对象）
 // void 方法返回 nullptr
 Il2CppObject* Il2CppResolver::RuntimeInvoke(const Il2CppMethod* method, void* obj, void** params, Il2CppException** outExc) const
@@ -797,11 +728,7 @@ Il2CppObject* Il2CppResolver::RuntimeInvoke(const Il2CppMethod* method, void* ob
     // 确保 outExc 有初始值
     if (outExc != nullptr) *outExc = nullptr;
 
-    // 关键：在调用方法前 确保类的静态构造函数(.cctor)已执行
-    // 未初始化的类在第一次调用方法时可能导致访问违规崩溃
-    Il2CppClass* klass = GetMethodClass(method);
-    if (klass != nullptr && m_runtime_class_init != nullptr) m_runtime_class_init(klass);
-
+    // runtime_invoke 自己处理静态初始化并捕获托管异常。
     return m_runtime_invoke(method, obj, params, outExc);
 }
 
@@ -813,41 +740,13 @@ void Il2CppResolver::RuntimeClassInit(Il2CppClass* klass) const
     if (klass == nullptr || m_runtime_class_init == nullptr) return;
     m_runtime_class_init(klass);
 }
-
-// ============================================================
 // 字符串操作
-// ============================================================
-
-// 从 C 字符串（UTF-8）创建 IL2CPP 托管字符串
-//
-// 参考 frida-il2cpp-bridge 实现 il2cpp_string_new 直接接受 UTF-8 编码字符串
-// IL2CPP 运行时内部完成 UTF-8→UTF-16 转换
-Il2CppString* Il2CppResolver::StringNew(const char* str) const
-{
-    if (str == nullptr) return nullptr;
-
-    if (m_string_new == nullptr) return nullptr;
-
-    return m_string_new(str);
-}
-
-// 从 UTF-16 字符串创建托管字符串
-Il2CppString* Il2CppResolver::StringNewUtf16(const uint16_t* utf16, int32_t len) const
-{
-    if (utf16 == nullptr || m_string_new_utf16 == nullptr) return nullptr;
-    return m_string_new_utf16(utf16, len);
-}
-
 // 从指定长度的字节创建托管字符串（可包含嵌入的 null）
 Il2CppString* Il2CppResolver::StringNewLen(const char* str, uint32_t len) const
 {
     if (str == nullptr) return nullptr;
 
-    if (m_string_new_len != nullptr) return m_string_new_len(str, len);
-
-    // 回退：创建临时null结尾字符串
-    std::string tmp(str, len);
-    return StringNew(tmp.c_str());
+    return m_string_new_len != nullptr ? m_string_new_len(str, len) : nullptr;
 }
 
 // 获取字符串的 UTF-16 字符数组指针
@@ -865,12 +764,33 @@ int32_t Il2CppResolver::StringLength(Il2CppString* str) const
     return m_string_length(str);
 }
 
-// ============================================================
+Il2CppString* Il2CppResolver::ObjectToString(Il2CppObject* object) const
+{
+    if (object == nullptr) return nullptr;
+
+    // 优先使用官方导出；部分 Unity 版本虽然能正常 runtime_invoke，
+    // 但不会导出 il2cpp_object_to_string，因此这里保留方法调用兜底。
+    if (m_object_to_string != nullptr)
+    {
+        Il2CppString* result = m_object_to_string(object);
+        if (result != nullptr) return result;
+    }
+
+    // 异常对象和普通托管对象一样，首字段是实际运行时类指针。直接查找
+    // ToString() 并通过 runtime_invoke 调用，兼容缺少 object_to_string 导出的版本。
+    Il2CppClass* klass = READ_OFFSET(object, 0, Il2CppClass*)[0];
+    const Il2CppMethod* method = GetMethod(klass, "ToString");
+    if (method == nullptr || GetMethodParamCount(method) != 0) return nullptr;
+
+    Il2CppException* exception = nullptr;
+    Il2CppObject* result = RuntimeInvoke(method, object, nullptr, &exception);
+    if (exception != nullptr || result == nullptr) return nullptr;
+    return reinterpret_cast<Il2CppString*>(result);
+}
 // 装箱 / 拆箱
-// ============================================================
 // 装箱 将值类型数据包装为托管对象
 // 参数
-// 
+//
 // ·klass — 值类型的 Il2CppClass
 // ·data  — 指向值类型数据的指针
 // 返回装箱后的 Il2CppObject*
@@ -887,10 +807,7 @@ void* Il2CppResolver::Unbox(Il2CppObject* obj) const
     if (obj == nullptr || m_object_unbox == nullptr) return nullptr;
     return m_object_unbox(obj);
 }
-
-// ============================================================
 // 类型信息
-// ============================================================
 // 获取 Il2CppType 的类型枚举值（Il2CppTypeEnum）
 // 返回值可用于判断是值类型、引用类型、基本类型等
 int32_t Il2CppResolver::GetTypeEnum(const Il2CppType* type) const
@@ -903,7 +820,16 @@ int32_t Il2CppResolver::GetTypeEnum(const Il2CppType* type) const
 const char* Il2CppResolver::GetTypeName(const Il2CppType* type) const
 {
     if (type == nullptr || m_type_get_name == nullptr) return nullptr;
-    return m_type_get_name(type);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = m_typeNames.find(type);
+    if (it != m_typeNames.end()) return it->second.c_str();
+    char* allocated = m_type_get_name(type);
+    if (allocated == nullptr) return nullptr;
+    // 导出返回 il2cpp_alloc 内存；缓存拥有副本，调用方借用到 Shutdown。
+    try { it = m_typeNames.emplace(type, allocated).first; }
+    catch (...) { m_free(allocated); throw; }
+    m_free(allocated);
+    return it->second.c_str();
 }
 
 // 从 Il2CppType 获取对应的 Il2CppClass
@@ -929,23 +855,16 @@ int32_t Il2CppResolver::ClassValueSize(Il2CppClass* klass, uint32_t* align) cons
 }
 
 // 从 Il2CppType 获取 System.Type 托管对象
-// 这是 FindObjectsOfType 的前置步骤
-// 
-// ·IL2CPP 的 FindObjectsOfType 需要一个 System.Type 参数 
-// ·而我们手里只有 Il2CppType* 需要通过此函数转换为
-// ·System.Type 的托管对象 
+// UnityEngine 的反射 API 需要 System.Type；该通用转换由 Unity 适配层复用。
 Il2CppObject* Il2CppResolver::GetTypeObject(const Il2CppType* type) const
 {
     if (type == nullptr || m_type_get_object == nullptr) return nullptr;
     return m_type_get_object(type);
 }
-
-// ============================================================
 // 数组操作
-// ============================================================
 // 创建一维零基数组
 // 参数
-// 
+//
 // ·elementClass — 数组元素的类型
 // ·length       — 数组长度（官方类型为 il2cpp_array_size_t 即 uint32_t）
 // 返回 Il2CppArray* 指针
@@ -956,8 +875,7 @@ Il2CppArray* Il2CppResolver::ArrayNew(Il2CppClass* elementClass, uint32_t length
 }
 
 // 读取数组长度
-// 直接从内存布局读取 不依赖导出函数
-// Il2CppArrayLayout 的 max_length 字段位于 offset 0x18
+// 直接从一维数组布局读取，不依赖额外导出函数。
 uint64_t Il2CppResolver::ArrayLength(Il2CppArray* arr) const
 {
     if (arr == nullptr) return 0;
@@ -965,93 +883,16 @@ uint64_t Il2CppResolver::ArrayLength(Il2CppArray* arr) const
     return READ_OFFSET(arr, 0x18, uint64_t)[0];
 }
 
-// ============================================================
-// GC 对象查找
-// ============================================================
-// 通过 Unity 的 UnityEngine.Object.FindObjectsOfType(Type) 查找
-// 堆上存活的指定类型对象 
-//
-// 实现步骤
-// 
-// ·从 klass 获取 Il2CppType*
-// ·从 Il2CppType* 获取 System.Type 托管对象
-// ·查找 UnityEngine.Object 类
-// ·在 UnityEngine.Object 上查找 FindObjectsOfType 方法
-// ·调用该方法 传入 System.Type 作为参数
-// ·返回结果数组
-//
-// 限制
-// 
-// ·仅对继承自 UnityEngine.Object 的类型有效
-// ·旧版 Unity 使用 FindObjectsOfType 新版可能需要 FindObjectsByType
-// ·需要 type_get_object 导出函数存在
-Il2CppArray* Il2CppResolver::FindObjectsOfType(Il2CppClass* klass)
+bool Il2CppResolver::ArraySetReference(
+    Il2CppArray* arr, uint64_t index, Il2CppObject* value) const
 {
-    // 前置检查
-    if (klass == nullptr) return nullptr;
-
-    // 需要 type_get_object 导出函数
-    if (m_type_get_object == nullptr || m_class_get_type == nullptr) return nullptr;
-
-    // 获取 Il2CppType*
-    const Il2CppType* type = m_class_get_type(klass);
-    if (type == nullptr) return nullptr;
-
-    // 转换为 System.Type 托管对象
-    Il2CppObject* typeObject = m_type_get_object(type);
-    if (typeObject == nullptr) return nullptr;
-
-    // 查找 UnityEngine.Object 类
-    Il2CppClass* unityObject = GetClass("UnityEngine", "Object");
-    if (unityObject == nullptr) return nullptr;
-
-    // 查找 FindObjectsOfType 方法
-    // 该方法签名为: static Object[] FindObjectsOfType(Type type)
-    // 参数个数为 1
-    const Il2CppMethod* findMethod = nullptr;
-
-    // 优先尝试 FindObjectsOfType
-    if (m_class_get_method_from_name != nullptr) findMethod = m_class_get_method_from_name(unityObject, "FindObjectsOfType", 1);
-
-    // 如果没找到 尝试备选名称 FindObjectsByType（Unity 2023+）
-    // 该方法签名为: static Object[] FindObjectsByType(Type type, FindObjectsSortMode sortMode)
-    // 参数个数为 2 需要额外传入排序模式（0 = None）
-    bool useFindObjectsByType = false;
-    if (findMethod == nullptr && m_class_get_method_from_name != nullptr)
-    {
-        findMethod = m_class_get_method_from_name(unityObject, "FindObjectsByType", 2);
-        if (findMethod != nullptr) useFindObjectsByType = true;
-    }
-
-    if (findMethod == nullptr) return nullptr;
-
-    // 准备参数并调用
-    // RuntimeInvoke 的 params 是 void** 数组 每个元素指向一个参数值
-    // 对于 FindObjectsOfType(Type type) params[0] = typeObject
-    void* params[2] = {};
-    // 第一个参数：System.Type 对象的地址
-    params[0] = typeObject;
-
-    // 如果是 FindObjectsByType 还需要第二个参数 FindObjectsSortMode
-    // FindObjectsSortMode.None = 0
-    int32_t sortMode = 0;
-    // 第二个参数：排序模式
-    if (useFindObjectsByType) params[1] = &sortMode;
-
-    // 调用方法（静态方法 obj 传 nullptr）
-    Il2CppException* exc = nullptr;
-    Il2CppObject* result = RuntimeInvoke(findMethod, nullptr, params, &exc);
-
-    // 如果发生异常 返回 nullptr
-    if (exc != nullptr) return nullptr;
-
-    // 返回值就是 Object[] 数组
-    return reinterpret_cast<Il2CppArray*>(result);
+    if (arr == nullptr || m_gc_wbarrier_set_field == nullptr || index >= ArrayLength(arr))
+        return false;
+    auto slot = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(arr) + 0x20) + index;
+    m_gc_wbarrier_set_field(reinterpret_cast<Il2CppObject*>(arr), slot, value);
+    return true;
 }
-
-// ============================================================
 // 方法/字段枚举
-// ============================================================
 // 遍历类的所有方法 写入 outList 数组
 // 返回实际写入的方法数量
 // 使用 class_get_methods 的迭代器模式逐个获取
@@ -1071,7 +912,7 @@ int32_t Il2CppResolver::EnumerateMethods(Il2CppClass* klass, const Il2CppMethod*
         // 达到最大数量 停止
         if (count >= maxCount) break;
         // 写入输出数组
-        outList[count] = method;  
+        outList[count] = method;
         // 计数
         ++count;
     }
@@ -1096,4 +937,35 @@ int32_t Il2CppResolver::EnumerateFields(Il2CppClass* klass, const Il2CppField** 
     }
 
     return count;
+}
+
+bool Il2CppResolver::IsByRef(const Il2CppType* type) const
+{
+    return type != nullptr && m_type_is_byref != nullptr && m_type_is_byref(type);
+}
+
+bool Il2CppResolver::HasReferences(Il2CppClass* klass) const
+{
+    return klass != nullptr && m_class_has_references != nullptr && m_class_has_references(klass);
+}
+
+uint32_t Il2CppResolver::RetainObject(Il2CppObject* obj) const
+{
+    // 固定句柄同时保证 userdata 缓存的对象地址稳定。
+    return obj != nullptr && m_gchandle_new != nullptr ? m_gchandle_new(obj, true) : 0;
+}
+
+void Il2CppResolver::ReleaseObject(uint32_t handle) const
+{
+    if (handle != 0 && m_gchandle_free != nullptr) m_gchandle_free(handle);
+}
+
+bool Il2CppResolver::IsGenericMethod(const Il2CppMethod* method) const
+{
+    return method != nullptr && m_method_is_generic != nullptr && m_method_is_generic(method);
+}
+
+bool Il2CppResolver::IsInflatedMethod(const Il2CppMethod* method) const
+{
+    return method != nullptr && m_method_is_inflated != nullptr && m_method_is_inflated(method);
 }

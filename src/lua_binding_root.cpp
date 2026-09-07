@@ -1,11 +1,8 @@
 /**
- * ============================================================
  * lua_binding_root.cpp — il2cpp/lua 全局表绑定
- * ============================================================
  * 负责不隶属于某个 userdata 的顶层能力：运行时状态、程序集和类查找、
  * 裸地址包装、Hook 全局清理、主线程调度，以及纯 Lua table 辅助工具。
  * 本模块只组织公开入口，具体反射、Hook 和调度工作委托给对应模块。
- * ============================================================
  */
 #include "lua_binding_internal.h"
 #include "il2cpp_hook.h"
@@ -13,10 +10,7 @@
 #include <windows.h>
 #include <cstdarg>
 #include <cstdio>
-
-// ============================================================
 // il2cpp 全局表函数
-// ============================================================
 // il2cpp.get_status() → string 导出函数的解析状态
 static int Il2Cpp_GetStatus(lua_State* L)
 {
@@ -41,7 +35,6 @@ static int Il2Cpp_GetStatus(lua_State* L)
 
     return 1;
 }
-
 // il2cpp.get_class(namespace, name) → Class | nil
 static int Il2Cpp_GetClass(lua_State* L)
 {
@@ -116,7 +109,7 @@ static int Il2Cpp_Wrap(lua_State* L)
     if (lua_islightuserdata(L, 1)) address = lua_touserdata(L, 1);
     // 整数地址
     else if (lua_isinteger(L, 1)) address = reinterpret_cast<void*>(static_cast<uintptr_t>(lua_tointeger(L, 1)));
-    else return luaL_error(L, "expected integer address or lightuserdata");
+    else return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "expected integer address or lightuserdata");
 
     if (address == nullptr || !IsReadableMemory(address, sizeof(Il2CppClass*)))
     {
@@ -142,14 +135,11 @@ static int Il2Cpp_Wrap(lua_State* L)
         return 2;
     }
 
-    // 显式传入已安全读取的 klass，避免 PushInstance 再次解引用对象头
-    LuaBridge_PushInstance(L, reinterpret_cast<Il2CppObject*>(address), klass);
+    // 基础可读性检查通过后包装对象；PushInstance 读取实际类并建立 GCHandle。
+    LuaBridge_PushInstance(L, reinterpret_cast<Il2CppObject*>(address));
     return 1;
 }
-
-// ============================================================
 // lua.each / lua.dump（Lua table 工具）
-// ============================================================
 // 支持 Lua 表（get_methods / get_fields 等返回的结果表）
 // 回调签名统一为 function(value, index) 索引从 1 开始
 
@@ -183,7 +173,7 @@ void LuaBridge_PrintDump(lua_State* L, const DumpBuffer* buffer)
     if (L == nullptr || buffer == nullptr) return;
 
     // dump 构造过程以换行结束，而 LuaPrint 也会追加换行。只移除末尾的
-    // CR/LF，保留内容内部的分行，使下一个 ILune 提示符只间隔一行。
+    // CR/LF，保留内容内部的分行，使下一个 Lune 提示符只间隔一行。
     size_t length = buffer->len;
     while (length > 0 && (buffer->data[length - 1] == '\n' || buffer->data[length - 1] == '\r'))
         --length;
@@ -199,26 +189,12 @@ static int DumpFormatCallback(lua_State* L)
     DumpBuffer* buf = static_cast<DumpBuffer*>(lua_touserdata(L, lua_upvalueindex(1)));
     if (buf == nullptr) return 0;
 
-    // 索引/键（整数或字符串）
-    std::string key;
-    if (lua_type(L, 2) == LUA_TNUMBER && lua_isinteger(L, 2))
-    {
-        key = std::to_string(static_cast<long long>(lua_tointeger(L, 2)));
-    }
-    else
-    {
-        size_t keyLen = 0;
-        const char* keyStr = luaL_tolstring(L, 2, &keyLen);
-        key.assign(keyStr ? keyStr : "?", keyStr ? keyLen : 1);
-        lua_pop(L, 1);  // tostring 结果
-    }
-
-    // 值（userdata 会走 __tostring 元方法）
-    size_t valLen = 0;
-    const char* valStr = luaL_tolstring(L, 1, &valLen);
-    LuaBridge_DumpAppend(buf, "[%s] = %.*s\n", key.c_str(),
-        static_cast<int>(valLen), valStr ? valStr : "?");
-    lua_pop(L, 1);  // tostring 结果
+    // 两个 tostring 结果都留在 Lua 栈上；后一个元方法报错也没有 C++ 资源泄漏。
+    const char* key = luaL_tolstring(L, 2, nullptr);
+    size_t length = 0;
+    const char* value = luaL_tolstring(L, 1, &length);
+    LuaBridge_DumpAppend(buf, "[%s] = %.*s\n", key, static_cast<int>(length), value);
+    lua_pop(L, 2);
 
     return 0;
 }
@@ -263,7 +239,7 @@ static int Lua_Hex(lua_State* L)
     }
     else
     {
-        return luaL_error(L, "hex expects an integer or lightuserdata");
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "hex expects an integer or lightuserdata");
     }
 
     char text[32]{};
@@ -277,20 +253,18 @@ static int Lua_Hex(lua_State* L)
 // 卸载全部已安装的方法 Hook
 static int Il2Cpp_UnhookAll(lua_State* L)
 {
+    (void)L;
     Il2CppHook::UnhookAll();
     return 0;
 }
-
-// ============================================================
 // il2cpp 主线程调度函数
-// ============================================================
-// schedule 只负责入队，由内部 tick hook 在 Unity 主线程取出执行。
+// schedule 只负责入队，由内部 tick hook 在选定的目标线程取出执行；通常应是 Unity 主线程。
 
 // il2cpp.schedule(fn) → 无返回值
 // 把一个 Lua 函数加入主线程执行队列
 static int Il2Cpp_Schedule(lua_State* L)
 {
-    if (!lua_isfunction(L, 1)) return luaL_error(L, "expected function as argument");
+    if (!lua_isfunction(L, 1)) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "expected function as argument");
 
     Il2CppScheduler::Schedule(L, 1);
     return 0;
@@ -301,7 +275,7 @@ static int Il2Cpp_Schedule(lua_State* L)
 static int Il2Cpp_SetTick(lua_State* L)
 {
     LuaMethodUD* ud = LuaBridge_CheckMethod(L, 1);
-    if (ud == nullptr) return luaL_error(L, "set_tick requires a Method");
+    if (ud == nullptr) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "set_tick requires a Method");
 
     auto& resolver = Il2CppResolver::Instance();
     if (resolver.GetMethodPointer(ud->method) == nullptr)
