@@ -32,6 +32,8 @@
 - [已知限制](#limitations)
 - [License](#license)
 
+<a id="project-positioning"></a>
+
 ## 🎯 项目定位
 
 Il2CppLua 是注入 Unity IL2CPP 游戏进程的原生运行时桥接 DLL。它从
