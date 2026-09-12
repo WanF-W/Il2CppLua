@@ -20,5 +20,6 @@ namespace Il2CppHook
     // Scheduler 后端；tick 身份与用户回调可以共存。
     bool InstallSchedulerTick(const Il2CppMethod* method, Il2CppClass* klass);
     bool IsSchedulerTickInstalled();
+    bool InstallMainThreadProbe(const Il2CppMethod* method, Il2CppClass* klass);
     void Shutdown();
 }

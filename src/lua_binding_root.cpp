@@ -306,7 +306,7 @@ static int Il2Cpp_SetTick(lua_State* L)
     if (!Il2CppScheduler::SetTick(ud->method, ud->klass))
     {
         lua_pushboolean(L, 0);
-        lua_pushstring(L, "failed to install tick hook");
+        lua_pushstring(L, "failed to install main-thread probe or tick hook");
         return 2;
     }
 

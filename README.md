@@ -4,7 +4,7 @@
 
 在 Windows x64 Unity IL2CPP 游戏进程中使用 Lua 查找程序集、访问类型和对象、调用方法、读写字段以及 Hook 方法。
 
-**v4.1.0** · Windows x64 · Lua 5.4.8 · MIT
+**v4.1.1** · Windows x64 · Lua 5.4.8 · MIT
 
 </div>
 
@@ -34,7 +34,7 @@
 - Windows x64。
 - 目标程序使用 Unity IL2CPP，并已加载 `GameAssembly.dll`。
 - 目标运行时保留 Il2CppLua 所需的 `il2cpp_*` 导出函数。
-- `Il2CppLua.dll` 与配套的 [Lune](../Lune) 使用同一套 IL2CPP 握手版本：`Il2CppLua/4.1.0`。
+- `Il2CppLua.dll` 与配套的 [Lune](../Lune) 使用同一套 IL2CPP 握手版本：`Il2CppLua/4.1.1`。
 
 Il2CppLua 读取目标进程中已经加载的 IL2CPP 程序集和 metadata，不读取未加载的 metadata 文件，
 也不适用于 Unity Mono 运行时。目标游戏、DLL 和 Lune 都必须是 Windows x64。
@@ -248,11 +248,11 @@ il2cpp.unhook_all()
 <a name="il2cpp-schedule"></a>
 #### 🧵 `il2cpp.schedule(callback)`
 
-将无参 Lua 回调加入任务队列。回调在后续 tick 执行，不同步返回结果。
+将无参 Lua 回调加入任务队列。确认主线程后，回调在该线程的后续 tick 执行，不同步返回结果。
 
 ```lua
 il2cpp.schedule(function()
-    print("running on the selected tick thread")
+    print("running on the detected Unity main thread")
 end)
 ```
 
@@ -263,7 +263,8 @@ end)
 #### ⏱️ `il2cpp.set_tick(method)`
 
 使用具有原生地址的精确 Method 作为调度 tick。成功返回 `true`；失败返回 `false, error`。
-应选择稳定、频繁且运行在 Unity 主线程的方法。
+应选择稳定、频繁且运行在 Unity 主线程的方法。切换 tick 不会改变已确认的主线程身份。
+如果主线程探针无法安装，设置失败；已入队任务保留等待。
 
 静态方法和实例方法都可以作为 tick。重复设置同一个 Method、切回曾经使用过的 Method，或选择
 已经安装用户 Hook 的 Method 时，会复用现有原生 Hook；用户回调与调度 tick 可以共存。
@@ -692,8 +693,11 @@ il2cpp.schedule(function()
 end)
 ```
 
-`il2cpp.schedule()` 的任务在选定 tick 线程执行。自动 tick 无法确认执行线程就是 Unity 主线程时，
-使用 `il2cpp.set_tick()` 指定合适的入口。
+`il2cpp.schedule()` 只在已确认的主线程命中选定 tick 时执行任务。主线程身份由独立的一次性
+`UnitySynchronizationContext.ExecuteTasks` 探针建立；无法安装时回退到 `Time.get_deltaTime`。
+探针只接受非嵌套原生调用，控制台主动调用和 Lua Hook 内的调用不能注册主线程。
+确认前任务保持排队，`set_tick()` 不会清除或重新绑定线程身份。
+`is_tick_ready()` 仅表示 tick Hook 已安装，不表示探针已确认主线程。
 
 ### 🪝 Hook 回调
 
@@ -717,7 +721,7 @@ IL2CPP 调用约定下 Hook；不支持泛型方法、实例化泛型方法、`r
 Lune 与 DLL 使用命名管道，并严格校验握手字符串：
 
 ```text
-MSG_HELLO: Il2CppLua/4.1.0
+MSG_HELLO: Il2CppLua/4.1.1
 ```
 
 版本不匹配时，Lune 会显示 `expected` 和 `received`，并在等待 READY 或进入 REPL 前终止连接。
@@ -788,7 +792,7 @@ dofile([[C:\Scripts\test.lua]])
 - 含托管引用的 struct 数组元素暂不支持直接写入。
 - Hook 只接受标准 IL2CPP Windows x64 调用约定，方法最多 64 个声明参数；值类型 Hook 的 Lua `this`
   是快照，修改不会写回原生值。
-- 默认调度 tick 不能证明线程一定是 Unity 主线程；需要可靠线程语义时必须使用 `set_tick`。
+- `Time.get_deltaTime` 回退探针依赖游戏在主线程调用该入口的惯例；无法像 `ExecuteTasks` 一样提供明确的 PlayerLoop 线程语义。
 - 任意裸地址即使当前可读，也可能在之后因对象销毁、内存复用或运行时状态变化而失效。
 - 发生原生故障后当前 Lua 会话会被永久隔离，必须重启目标进程恢复。
 

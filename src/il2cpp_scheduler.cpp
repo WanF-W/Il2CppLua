@@ -44,6 +44,30 @@ namespace
     bool g_failureLogged = false;
     bool g_draining = false; // 由 LuaEngine 锁串行保护，阻止任务内嵌套 tick。
     std::atomic<DWORD> g_mainThreadId{0};
+    bool g_probeInstalled = false; // 安装由 g_installMutex 保护，Shutdown 独占清理
+
+    // 与用户选择的 tick 无关；整个会话只确认一次线程身份。
+    bool EnsureMainThreadProbe()
+    {
+        if (g_probeInstalled) return true;
+        static constexpr TickCandidate probes[] = {
+            {"UnityEngine", "UnitySynchronizationContext", "ExecuteTasks"},
+            {"UnityEngine", "Time", "get_deltaTime"},
+        };
+        auto& resolver = Il2CppResolver::Instance();
+        for (const auto& probe : probes)
+        {
+            auto* klass = resolver.GetClass(probe.namespaze, probe.className);
+            if (klass == nullptr) continue;
+            const auto* method = resolver.GetMethod(klass, probe.methodName);
+            if (method != nullptr && Il2CppHook::InstallMainThreadProbe(method, klass))
+            {
+                g_probeInstalled = true;
+                return true;
+            }
+        }
+        return false;
+    }
 
     void LogInstallFailureOnce()
     {
@@ -51,7 +75,7 @@ namespace
         if (g_failureLogged) return;
         g_failureLogged = true;
         PipeChannel::Instance().SendLog(
-            "[schedule] tick hook not installed; use il2cpp.set_tick(method) to specify an entry\n");
+            "[schedule] main-thread probe or tick hook unavailable; tasks remain queued; set_tick can retry installation\n");
     }
 }
 
@@ -94,6 +118,9 @@ bool Il2CppScheduler::SetTick(const Il2CppMethod* method, Il2CppClass* klass)
     if (klass == nullptr) klass = resolver.GetMethodClass(method);
     if (klass == nullptr || resolver.GetMethodPointer(method) == nullptr) return false;
 
+    // 探针缺失时不能将任意 tick 用作线程识别入口。
+    if (!EnsureMainThreadProbe()) return false;
+
     // Hook 层只安装原生跳板；入口选择和公开状态由 Scheduler 持有。
     if (!Il2CppHook::InstallSchedulerTick(method, klass))
     {
@@ -106,9 +133,6 @@ bool Il2CppScheduler::SetTick(const Il2CppMethod* method, Il2CppClass* klass)
         g_tickClass = klass;
         g_failureLogged = false;
     }
-    // 不再根据线程创建时间猜测主线程。首次真正触发所选 tick 的线程
-    // 才会被记录；这要求 set_tick 选择一个稳定地运行在目标线程上的方法。
-    g_mainThreadId.store(0, std::memory_order_relaxed);
     return true;
 }
 
@@ -150,18 +174,20 @@ bool Il2CppScheduler::EnsureInstalled()
     return false;
 }
 
+void Il2CppScheduler::ObserveMainThread()
+{
+    DWORD expected = 0;
+    g_mainThreadId.compare_exchange_strong(expected, GetCurrentThreadId(),
+        std::memory_order_relaxed);
+}
+
 void Il2CppScheduler::Drain(lua_State* L)
 {
     LuaEngine::Instance().RequireHealthy();
     if (L == nullptr || g_draining) return;
 
-    DWORD mainId = g_mainThreadId.load(std::memory_order_relaxed);
-    if (mainId == 0)
-    {
-        mainId = GetCurrentThreadId();
-        g_mainThreadId.store(mainId, std::memory_order_relaxed);
-    }
-    if (GetCurrentThreadId() != mainId) return;
+    const DWORD mainId = g_mainThreadId.load(std::memory_order_relaxed);
+    if (mainId == 0 || GetCurrentThreadId() != mainId) return;
 
     g_draining = true;
     struct DrainGuard { ~DrainGuard() { g_draining = false; } } guard;
@@ -218,6 +244,7 @@ void Il2CppScheduler::Shutdown(lua_State* L)
     }
 
     std::lock_guard<std::mutex> lock(g_stateMutex);
+    g_probeInstalled = false;
     g_tickMethod = nullptr;
     g_tickClass = nullptr;
     g_failureLogged = false;

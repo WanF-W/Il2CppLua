@@ -60,7 +60,7 @@ static_assert(sizeof(NativeHookContext) == 0x70, "NativeHookContext size mismatc
 // 由本文件定义 供 hook_stub.asm 调用的分发器
 extern "C" void HookDispatch(NativeHookContext* ctx);
 // 实际分发逻辑（HookDispatch 的 SEH 安全壳调用）
-static void DispatchSafe(NativeHookContext* ctx);
+static void DispatchSafe(NativeHookContext* ctx, bool nested);
 // 参数类型缓存
 // 安装 Hook 时把每个参数的反射信息缓存下来
 // 缓存原生布局；类型兼容性与转换仍由统一的 Resolver/值转换接口处理。
@@ -81,6 +81,7 @@ struct HookEntry
     uint32_t hookId = 0;                  // thunk 中写入的编号
 
     bool enabled = false;                 // 当前是否处于启用状态
+    bool isMainThreadProbe = false;       // 独立的一次性主线程探针
     bool isInternalTick = false;          // 同时作为调度 tick，可与用户回调共存
 
     Il2CppClass* klass = nullptr;         // 声明类
@@ -264,7 +265,7 @@ static bool PopulateHookMetadata(
 }
 // 内部 tick Hook 后端
 // 调度策略位于 il2cpp_scheduler.cpp；这里仅负责复用原生 Hook 跳板。
-static bool TryInstallTickHook(const Il2CppMethod* method, Il2CppClass* klass)
+static bool TryInstallTickHook(const Il2CppMethod* method, Il2CppClass* klass, bool probe = false)
 {
     auto& resolver = Il2CppResolver::Instance();
     if (!resolver.IsInitialized() || method == nullptr) return false;
@@ -287,10 +288,14 @@ static bool TryInstallTickHook(const Il2CppMethod* method, Il2CppClass* klass)
         const MH_STATUS status = MH_EnableHook(target);
         if (status != MH_OK && status != MH_ERROR_ENABLED) return false;
 
-        existing->isInternalTick = true;
+        if (probe) existing->isMainThreadProbe = true;
+        else existing->isInternalTick = true;
         existing->enabled = true;
-        g_tickHookId = i;
-        g_tickInstalled = true;
+        if (!probe)
+        {
+            g_tickHookId = i;
+            g_tickInstalled = true;
+        }
         return true;
     }
 
@@ -300,7 +305,8 @@ static bool TryInstallTickHook(const Il2CppMethod* method, Il2CppClass* klass)
     entry->hookId = static_cast<uint32_t>(g_entries.size());
     entry->target = target;
     if (!PopulateHookMetadata(entry.get(), method, klass)) return false;
-    entry->isInternalTick = true;   // 分发器走 tick 分支
+    entry->isInternalTick = !probe;
+    entry->isMainThreadProbe = probe;
     entry->luaRef = LUA_REFNIL;
 
     entry->thunk = AllocateThunk(entry->hookId, GetHookDetourAddress());
@@ -324,8 +330,11 @@ static bool TryInstallTickHook(const Il2CppMethod* method, Il2CppClass* klass)
 
     entry->enabled = true;
     g_entries.push_back(std::move(entry));
-    g_tickHookId = static_cast<uint32_t>(g_entries.size() - 1);
-    g_tickInstalled = true;
+    if (!probe)
+    {
+        g_tickHookId = static_cast<uint32_t>(g_entries.size() - 1);
+        g_tickInstalled = true;
+    }
     return true;
 }
 // 参数槽位游标（x64 寄存器/栈分配）
@@ -651,7 +660,7 @@ extern "C" void HookDispatch(NativeHookContext* ctx)
         __try
         {
             ctx->original = *originalSlot;
-            DispatchSafe(ctx);
+            DispatchSafe(ctx, nested);
         }
         __except ((LuaEngine::Instance().Quarantine(GetExceptionCode()),
             nested ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER))
@@ -683,7 +692,7 @@ extern "C" void HookDispatch(NativeHookContext* ctx)
 
 // 实际分发逻辑（不能在 __try 函数中出现需要展开的 C++ 对象）
 // 正常原方法回退由 NativeInvoke 完成；隔离和内部类型查询由汇编透传。
-static void DispatchSafe(NativeHookContext* ctx)
+static void DispatchSafe(NativeHookContext* ctx, bool nested)
 {
     // 异常恢复标志（供 HookDispatch 的 __except 使用）。bit 0 表示 Lua
     // 锁，bit 1 表示 registry 锁；两把锁都使用显式路径管理。
@@ -749,6 +758,18 @@ static void DispatchSafe(NativeHookContext* ctx)
 
     // tick 身份可以与用户 Hook 共存。没有用户回调时只排空调度队列；
     // 有回调时继续 pin 并执行回调，随后再排空队列。
+    // 控制台调用及 Lua 回调引发的嵌套分发不能确认线程身份。
+    // 在用户回调之前识别，并在注册表锁内停用探针身份。
+    if (e->isMainThreadProbe && !nested)
+    {
+        Il2CppScheduler::ObserveMainThread();
+        e->isMainThreadProbe = false;
+        if (!e->isInternalTick && e->luaRef == LUA_REFNIL)
+        {
+            MH_DisableHook(e->target);
+            e->enabled = false;
+        }
+    }
     isTick = e->isInternalTick;
     if (isTick && e->luaRef == LUA_REFNIL)
     {
@@ -960,7 +981,7 @@ bool Il2CppHook::UnhookMethod(const Il2CppMethod* method)
 
     // tick 与用户回调共享条目时只移除 Lua 回调，底层 Hook 必须保持启用。
     // 普通用户 Hook 仍只禁用、不移除，以便安全复用 trampoline。
-    if (!e->isInternalTick)
+    if (!e->isInternalTick && !e->isMainThreadProbe)
     {
         if (e->target != nullptr) MH_DisableHook(e->target);
         e->enabled = false;
@@ -994,7 +1015,7 @@ void Il2CppHook::UnhookAll()
     for (auto& entry : g_entries)
     {
         // 共享 tick 的条目只移除用户回调；纯用户 Hook 同时禁用底层 Hook。
-        if (!entry->isInternalTick)
+        if (!entry->isInternalTick && !entry->isMainThreadProbe)
         {
             if (entry->target != nullptr) MH_DisableHook(entry->target);
             entry->enabled = false;
@@ -1019,13 +1040,20 @@ bool Il2CppHook::InstallSchedulerTick(const Il2CppMethod* method, Il2CppClass* k
     {
         HookEntry* old = g_entries[oldId].get();
         old->isInternalTick = false;
-        if (old->luaRef == LUA_REFNIL)
+        if (old->luaRef == LUA_REFNIL && !old->isMainThreadProbe)
         {
             old->enabled = false;
             MH_DisableHook(old->target);
         }
     }
     return true;
+}
+
+bool Il2CppHook::InstallMainThreadProbe(const Il2CppMethod* method, Il2CppClass* klass)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_shutdown.load(std::memory_order_acquire)) return false;
+    return TryInstallTickHook(method, klass, true);
 }
 
 bool Il2CppHook::IsSchedulerTickInstalled()

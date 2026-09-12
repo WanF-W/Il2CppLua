@@ -1,6 +1,6 @@
 /**
  * il2cpp_scheduler.h — Unity 主线程调度器
- * 管理 Lua 回调队列、tick 入口选择和 tick 线程识别。
+ * 管理 Lua 回调队列、tick 入口选择和独立主线程识别。
  * 原生 tick Hook 的安装由 Il2CppHook 提供，调度策略不侵入用户 Hook API。
  */
 #pragma once
@@ -23,7 +23,10 @@ namespace Il2CppScheduler
     bool IsReady();
     bool EnsureInstalled();
 
-    // 由内部 tick Hook 调用；第一次触发所选 tick 的线程被视为目标主线程。
+    // 仅供独立探针的非嵌套原生事件调用；CAS 绑定一次线程身份。
+    void ObserveMainThread();
+
+    // 由内部 tick Hook 调用；线程未确认或当前不在主线程时不执行队列。
     void Drain(lua_State* L);
 
     // Lua VM 销毁前释放尚未执行的 registry 引用并重置状态。
