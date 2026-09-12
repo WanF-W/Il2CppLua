@@ -27,16 +27,34 @@ HookDetourEntry PROC FRAME
     xor eax, eax
     mov [r12+32+50h], rax
     mov [r12+32+58h], rax
-    mov [r12+32+60h], rax
+    mov [r12+32+60h], r11 ; stable trampoline slot in the per-method thunk
     mov [r12+32+68h], rax
     lea rcx, [r12+32]
     call HookDispatch
+    mov r11, [r12+32+60h]
+    test r11, r11
+    jnz bypass_lua
     mov rax, [r12+32+50h]
     movsd xmm0, qword ptr [r12+32+58h]
     lock dec qword ptr [g_activeDetours]
     add rsp, 144
     pop r12
     ret
+bypass_lua:
+    ; Quarantine retains this DLL and every trampoline. Restore the original
+    ; call frame and tail-call without Lua, metadata, or registry locks.
+    mov rcx, [r12+32+00h]
+    mov rdx, [r12+32+08h]
+    mov r8, [r12+32+10h]
+    mov r9, [r12+32+18h]
+    movsd xmm0, qword ptr [r12+32+20h]
+    movsd xmm1, qword ptr [r12+32+28h]
+    movsd xmm2, qword ptr [r12+32+30h]
+    movsd xmm3, qword ptr [r12+32+38h]
+    lock dec qword ptr [g_activeDetours]
+    add rsp, 144
+    pop r12
+    jmp qword ptr [r11] ; ModRM mod=00: valid Windows x64 tail epilogue
 HookDetourEntry ENDP
 
 ; RCX=context，EDX=栈参数数量（最多 63）。前 32 字节为 shadow space。

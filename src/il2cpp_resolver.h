@@ -68,6 +68,13 @@ public:
     // 判断类是否为值类型 / 枚举
     bool IsValueType(Il2CppClass* klass) const;
     bool IsEnum(Il2CppClass* klass) const;
+    // Unknown/stripped reflection information is rejected, never assumed closed.
+    bool IsClosedClass(Il2CppClass* klass) const;
+    bool IsNullableClass(Il2CppClass* klass) const;
+    bool CanUseClass(Il2CppClass* klass) const;
+    bool CanMarshalType(const Il2CppType* type) const;
+    bool CanInvokeMethod(const Il2CppMethod* method) const;
+    static bool IsTypeQueryActive() { return s_typeQueryActive; }
     // 方法查找与信息
     // 按方法名查找（不考虑参数个数）返回第一个同名方法
     const Il2CppMethod* GetMethod(Il2CppClass* klass, const std::string& name) const;
@@ -159,6 +166,8 @@ public:
     // 方法 / 字段枚举
     // 遍历类的所有方法 写入 outList 返回数量
     int32_t EnumerateMethods(Il2CppClass* klass, const Il2CppMethod** outList, int32_t maxCount) const;
+    const Il2CppMethod* NextMethod(Il2CppClass* klass, void*& iterator) const;
+    const Il2CppField* NextField(Il2CppClass* klass, void*& iterator) const;
     // 遍历类的所有字段
     int32_t EnumerateFields(Il2CppClass* klass, const Il2CppField** outList, int32_t maxCount) const;
 
@@ -343,6 +352,8 @@ private:
     std::map<std::pair<std::string, std::string>, Il2CppClass*> m_classCache;
 
     mutable std::map<const Il2CppType*, std::string> m_typeNames;
+    mutable std::map<Il2CppClass*, bool> m_closedClasses;
+    static thread_local bool s_typeQueryActive;
     mutable std::mutex m_mutex;
     bool m_initialized = false;
 };

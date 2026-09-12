@@ -427,3 +427,8 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Local release materials are uploaded manually and must not enter Git.
+.release_local/
+ReleaseOutline_*.md
+Il2CppLua_Maintenance_Rules.local.md

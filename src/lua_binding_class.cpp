@@ -137,11 +137,9 @@ static int Class_GetMethod(lua_State* L)
     for (int i = 0; i < typeCount; ++i) luaL_checkstring(L, 3 + i);
     for (auto* current = ud->klass; current != nullptr; current = resolver.GetClassParent(current))
     {
-        const Il2CppMethod* methods[1024];
-        const int methodCount = resolver.EnumerateMethods(current, methods, 1024);
-        for (int i = 0; i < methodCount; ++i)
+        void* iterator = nullptr;
+        while (const auto* method = resolver.NextMethod(current, iterator))
         {
-            const auto* method = methods[i];
             if (strcmp(resolver.GetMethodName(method), name) != 0
                 || resolver.GetMethodParamCount(method) != typeCount) continue;
             bool matched = true;
@@ -166,18 +164,14 @@ static int Class_GetMethods(lua_State* L)
     LuaClassUD* ud = static_cast<LuaClassUD*>(luaL_checkudata(L, 1, LuaBridgeMT::CLASS));
     auto& resolver = Il2CppResolver::Instance();
 
-    // 枚举所有方法（最多 1024 个）
-    constexpr int32_t MAX_METHODS = 1024;
-    auto** methods = static_cast<const Il2CppMethod**>(LuaBridge_NewBuffer(L, sizeof(Il2CppMethod*) * MAX_METHODS));
-    int32_t count = resolver.EnumerateMethods(
-        ud->klass, methods, MAX_METHODS);
-
+    void* iterator = nullptr;
+    lua_Integer index = 0;
     lua_newtable(L);
-    for (int32_t i = 0; i < count; ++i)
+    while (const auto* method = resolver.NextMethod(ud->klass, iterator))
     {
-        LuaBridge_PushMethod(L, methods[i]);
+        LuaBridge_PushMethod(L, method);
         // Lua 索引从 1 开始
-        lua_rawseti(L, -2, static_cast<lua_Integer>(i) + 1);
+        lua_rawseti(L, -2, ++index);
     }
     return 1;
 }
@@ -199,16 +193,13 @@ static int Class_GetFields(lua_State* L)
     LuaClassUD* ud = static_cast<LuaClassUD*>(luaL_checkudata(L, 1, LuaBridgeMT::CLASS));
     auto& resolver = Il2CppResolver::Instance();
 
-    constexpr int32_t MAX_FIELDS = 1024;
-    auto** fields = static_cast<const Il2CppField**>(LuaBridge_NewBuffer(L, sizeof(Il2CppField*) * MAX_FIELDS));
-    int32_t count = resolver.EnumerateFields(
-        ud->klass, fields, MAX_FIELDS);
-
+    void* iterator = nullptr;
+    lua_Integer index = 0;
     lua_newtable(L);
-    for (int32_t i = 0; i < count; ++i)
+    while (const auto* field = resolver.NextField(ud->klass, iterator))
     {
-        LuaBridge_PushField(L, fields[i]);
-        lua_rawseti(L, -2, static_cast<lua_Integer>(i) + 1);
+        LuaBridge_PushField(L, field);
+        lua_rawseti(L, -2, ++index);
     }
     return 1;
 }
@@ -219,6 +210,8 @@ static int Class_New(lua_State* L)
 {
     LuaClassUD* ud = static_cast<LuaClassUD*>(luaL_checkudata(L, 1, LuaBridgeMT::CLASS));
     auto& resolver = Il2CppResolver::Instance();
+    if (!resolver.CanUseClass(ud->klass))
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "cannot construct open/Nullable type or type with unavailable metadata");
 
     // 先解析构造函数，再分配对象。参数错误时不应留下一个永远不会使用的
     // 托管对象。
@@ -243,6 +236,8 @@ static int Class_Alloc(lua_State* L)
 {
     LuaClassUD* ud = static_cast<LuaClassUD*>(luaL_checkudata(L, 1, LuaBridgeMT::CLASS));
     auto& resolver = Il2CppResolver::Instance();
+    if (!resolver.CanUseClass(ud->klass))
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "cannot allocate open/Nullable type or type with unavailable metadata");
     resolver.RuntimeClassInit(ud->klass);
     Il2CppObject* obj = resolver.ObjectNew(ud->klass);
     if (obj == nullptr) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "failed to allocate object");
@@ -255,6 +250,8 @@ static int Class_Alloc(lua_State* L)
 static int Class_NewArray(lua_State* L)
 {
     LuaClassUD* ud = static_cast<LuaClassUD*>(luaL_checkudata(L, 1, LuaBridgeMT::CLASS));
+    if (!Il2CppResolver::Instance().CanUseClass(ud->klass))
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "unsupported array element class (open/Nullable or unavailable metadata)");
     const lua_Integer requestedLength = luaL_checkinteger(L, 2);
     if (requestedLength < 0 || static_cast<uint64_t>(requestedLength) > UINT32_MAX)
         return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "array length must be between 0 and %u", UINT32_MAX);
@@ -402,6 +399,7 @@ static int Class_Dump(lua_State* L)
     // DumpBuffer 较大，使用 Lua userdata 存放，避免占用 256KB 线程栈。
     DumpBuffer* buffer = static_cast<DumpBuffer*>(lua_newuserdata(L, sizeof(DumpBuffer)));
     buffer->len = 0;
+    buffer->truncated = false;
     LuaBridge_DumpAppend(buffer, "Class: %s%s%s\n",
         namespaze != nullptr && namespaze[0] != '\0' ? namespaze : "",
         namespaze != nullptr && namespaze[0] != '\0' ? "." : "",
@@ -419,14 +417,13 @@ static int Class_Dump(lua_State* L)
     LuaBridge_DumpAppend(buffer, "Address: 0x%p\n", ud->klass);
     LuaBridge_DumpAppend(buffer, "Instance Size: %d\n\n", resolver.GetClassInstanceSize(ud->klass));
 
-    // 反射项上限沿用 resolver 的固定枚举上限，但存储放在堆上。
-    // 避免字段和方法各 1024 个指针同时占用约 16KB 线程栈（C6262）。
+    // 展示最多 1024 项，多取一项检测截断；查询接口不受展示预算限制。
     constexpr int32_t MAX_FIELDS = 1024;
-    auto** fields = static_cast<const Il2CppField**>(LuaBridge_NewBuffer(L, sizeof(Il2CppField*) * MAX_FIELDS));
+    auto** fields = static_cast<const Il2CppField**>(LuaBridge_NewBuffer(L, sizeof(Il2CppField*) * (MAX_FIELDS + 1)));
     const int32_t fieldCount = resolver.EnumerateFields(
-        ud->klass, fields, MAX_FIELDS);
-    LuaBridge_DumpAppend(buffer, "Fields (%d):\n", fieldCount);
-    for (int32_t i = 0; i < fieldCount; ++i)
+        ud->klass, fields, MAX_FIELDS + 1);
+    LuaBridge_DumpAppend(buffer, "Fields (first %d%s):\n", fieldCount > MAX_FIELDS ? MAX_FIELDS : fieldCount, fieldCount > MAX_FIELDS ? "; truncated" : "");
+    for (int32_t i = 0; i < fieldCount && i < MAX_FIELDS; ++i)
     {
         const char* fieldName = resolver.GetFieldName(fields[i]);
         const char* fieldType = resolver.GetTypeName(resolver.GetFieldType(fields[i]));
@@ -437,11 +434,11 @@ static int Class_Dump(lua_State* L)
     }
 
     constexpr int32_t MAX_METHODS = 1024;
-    auto** methods = static_cast<const Il2CppMethod**>(LuaBridge_NewBuffer(L, sizeof(Il2CppMethod*) * MAX_METHODS));
+    auto** methods = static_cast<const Il2CppMethod**>(LuaBridge_NewBuffer(L, sizeof(Il2CppMethod*) * (MAX_METHODS + 1)));
     const int32_t methodCount = resolver.EnumerateMethods(
-        ud->klass, methods, MAX_METHODS);
-    LuaBridge_DumpAppend(buffer, "\nMethods (%d):\n", methodCount);
-    for (int32_t i = 0; i < methodCount; ++i)
+        ud->klass, methods, MAX_METHODS + 1);
+    LuaBridge_DumpAppend(buffer, "\nMethods (first %d%s):\n", methodCount > MAX_METHODS ? MAX_METHODS : methodCount, methodCount > MAX_METHODS ? "; truncated" : "");
+    for (int32_t i = 0; i < methodCount && i < MAX_METHODS; ++i)
     {
         const Il2CppMethod* method = methods[i];
         const char* methodName = resolver.GetMethodName(method);

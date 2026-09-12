@@ -14,14 +14,9 @@ namespace
         Il2CppResolver& resolver, Il2CppClass* klass,
         const char* name, int32_t paramCount)
     {
-        constexpr int32_t MAX_METHODS = 512;
-        const Il2CppMethod* methods[MAX_METHODS] = {};
-        const int32_t methodCount = resolver.EnumerateMethods(
-            klass, methods, MAX_METHODS);
-
-        for (int32_t i = 0; i < methodCount; ++i)
+        void* iterator = nullptr;
+        while (const auto* method = resolver.NextMethod(klass, iterator))
         {
-            const Il2CppMethod* method = methods[i];
             const char* methodName = resolver.GetMethodName(method);
             if (methodName != nullptr
                 && std::strcmp(methodName, name) == 0

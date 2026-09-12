@@ -26,6 +26,7 @@ struct DumpBuffer
     // dump 可能输出大量反射项，缓冲区由 Lua userdata 分配在堆上。
     char data[262144];
     size_t len = 0;
+    bool truncated = false;
 };
 
 // ---- Lua/C# 值转换与调用 ----

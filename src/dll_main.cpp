@@ -59,7 +59,7 @@ public:
 
     ~ScopedIl2CppAttach() noexcept
     {
-        if (m_thread != nullptr) m_resolver.DetachThread(m_thread);
+        if (m_thread != nullptr && !LuaEngine::Instance().IsFaulted()) m_resolver.DetachThread(m_thread);
     }
 
     ScopedIl2CppAttach(const ScopedIl2CppAttach&) = delete;
@@ -76,6 +76,13 @@ private:
 // 实际的工作线程实现（包含 C++ 对象 不能放在 __try 中）
 static void ShutdownBridge()
 {
+    if (LuaEngine::Instance().IsFaulted())
+    {
+        // Retain VM, GCHandles, registry, trampolines and runtime attachment.
+        // Their integrity is unknown; only the independent IPC channel closes.
+        PipeChannel::Instance().Shutdown();
+        return;
+    }
     auto& resolver = Il2CppResolver::Instance();
     // 正常消息循环期间 Init 线程已经脱离；清理 Lua userdata 时临时附着，
     // 这样 GCHandle 等 IL2CPP 资源仍在运行时有效时释放。
@@ -85,6 +92,11 @@ static void ShutdownBridge()
         // 初始化线程仍然 attach 时复用它；否则只临时附加当前清理线程。
         ScopedIl2CppAttach shutdownAttach(resolver, !hasInitializationThread);
         Il2CppHook::Shutdown();
+        if (LuaEngine::Instance().IsFaulted())
+        {
+            PipeChannel::Instance().Shutdown();
+            return;
+        }
         LuaEngine::Instance().Shutdown();
     }
     resolver.Shutdown();
@@ -182,7 +194,11 @@ static void DllWorkerMain()
 
     // 发送握手帧（版本字符串）
     // EXE 收到后检查版本是否匹配
-    PipeChannel::Instance().SendHello();
+    if (!PipeChannel::Instance().SendHello())
+    {
+        PipeChannel::Instance().Shutdown();
+        return;
+    }
     // 初始化 IL2CPP 运行时桥接
     // GameAssembly.dll 可能尚未加载（游戏启动早期）
     // 重试等待最多 30 秒（60 次 × 500ms）
@@ -233,7 +249,11 @@ static void DllWorkerMain()
     // 构造状态消息 包含 IL2CPP 镜像数量
     char statusMsg[256];
     sprintf_s(statusMsg, 256, "IL2CPP resolved: %d images, Lua ready", Il2CppResolver::Instance().GetImageCount());
-    PipeChannel::Instance().SendReady(statusMsg);
+    if (!PipeChannel::Instance().SendReady(statusMsg))
+    {
+        ShutdownBridge();
+        return;
+    }
 
     // 空闲等待命令时不要让游戏运行时把这个线程视为长期活动的托管线程。
     // 每条命令会在执行前重新 Attach，执行完立即 Detach。
@@ -255,6 +275,12 @@ static void DllWorkerMain()
         {
         case protocol::MSG_CMD:
         {
+            if (LuaEngine::Instance().IsFaulted())
+            {
+                const auto error = LuaEngine::Instance().GetLastError();
+                if (!PipeChannel::Instance().SendError(error.category, error.line, error.message.c_str())) goto exit_loop;
+                break;
+            }
             // 执行 Lua 代码字符串
             // 将负载转换为以零结尾的字符串
             // payload 中不包含零终止符 需要手动添加
@@ -273,23 +299,29 @@ static void DllWorkerMain()
 
             // 执行 Lua 代码
             // LuaEngine 内部会将 print 输出和返回值通过管道回传
-            bool ok = LuaEngine::Instance().ExecuteString(code.c_str());
+            bool ok = LuaEngine::Instance().ExecuteString(code.c_str(), code.size());
 
             // 根据执行结果发送 OK 或 ERROR
             if (ok)
             {
-                PipeChannel::Instance().SendOk();
+                if (!PipeChannel::Instance().SendOk()) goto exit_loop;
             }
             else
             {
                 const auto error = LuaEngine::Instance().GetLastError();
-                PipeChannel::Instance().SendError(error.category, error.line, error.message.c_str());
+                if (!PipeChannel::Instance().SendError(error.category, error.line, error.message.c_str())) goto exit_loop;
             }
         }
         break;
 
         case protocol::MSG_FILE:
         {
+            if (LuaEngine::Instance().IsFaulted())
+            {
+                const auto error = LuaEngine::Instance().GetLastError();
+                if (!PipeChannel::Instance().SendError(error.category, error.line, error.message.c_str())) goto exit_loop;
+                break;
+            }
             // 执行 Lua 文件
             // 负载为文件路径
             std::string path(payload.begin(), payload.end());
@@ -306,17 +338,17 @@ static void DllWorkerMain()
             }
 
             // 执行 Lua 文件
-            bool ok = LuaEngine::Instance().ExecuteFile(path.c_str());
+            bool ok = LuaEngine::Instance().ExecuteFile(path.c_str(), path.size());
 
             // 根据执行结果发送 OK 或 ERROR
             if (ok)
             {
-                PipeChannel::Instance().SendOk();
+                if (!PipeChannel::Instance().SendOk()) goto exit_loop;
             }
             else
             {
                 const auto error = LuaEngine::Instance().GetLastError();
-                PipeChannel::Instance().SendError(error.category, error.line, error.message.c_str());
+                if (!PipeChannel::Instance().SendError(error.category, error.line, error.message.c_str())) goto exit_loop;
             }
         }
         break;
@@ -358,10 +390,11 @@ static DWORD WINAPI WorkerThreadProc(LPVOID lpParam)
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
+        LuaEngine::Instance().Quarantine(GetExceptionCode());
         // 捕获到致命的结构化异常
         // 尝试通知 EXE（管道可能已断开 忽略失败）
         PipeChannel::Instance().SendError(
-            protocol::ErrorCategory::Il2Cpp, -1, "fatal exception in worker thread");
+            protocol::ErrorCategory::Il2Cpp, -1, "native fault in worker thread; session quarantined; restart target process");
 
         // 确保资源被清理
         ShutdownBridge();
@@ -376,7 +409,10 @@ static DWORD WINAPI WorkerThreadProc(LPVOID lpParam)
     // ·如果引用计数降为 0 DLL 被卸载（触发 DLL_PROCESS_DETACH）
     //
     // 注意：此调用不会返回 之后的代码不会执行
-    if (g_hSelfModule != nullptr) FreeLibraryAndExitThread(g_hSelfModule, 0);
+    // Faulted Hooks may still jump through this DLL. Retain its loader reference
+    // until process exit; never unload code referenced by the abandoned VM.
+    if (g_hSelfModule != nullptr && !LuaEngine::Instance().IsFaulted())
+        FreeLibraryAndExitThread(g_hSelfModule, 0);
 
     return 0;
 }

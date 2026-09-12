@@ -26,12 +26,14 @@
 
 #include "pipe_channel.h"
 #include <algorithm>
+#include <chrono>
 
 namespace
 {
     constexpr size_t MAX_LOG_LENGTH = 64 * 1024;
     constexpr size_t MAX_LOG_QUEUE_ITEMS = 1024;
     constexpr size_t MAX_LOG_QUEUE_BYTES = 4 * 1024 * 1024;
+    constexpr DWORD WRITE_TIMEOUT_MS = 10000;
 }
 // 单例获取 C++11 线程安全的局部静态变量初始化
 PipeChannel& PipeChannel::Instance()
@@ -84,6 +86,11 @@ bool PipeChannel::Init()
         m_logWriting = false;
         m_logQueue.clear();
         m_logQueueBytes = 0;
+        m_logAccepted = m_logCompleted = 0;
+        m_logFailed = false;
+        m_rejectedLogBatches.store(0, std::memory_order_relaxed);
+        m_discardedLogFrames.store(0, std::memory_order_relaxed);
+        m_droppedLogBytes.store(0, std::memory_order_relaxed);
     }
     m_stopping.store(false, std::memory_order_release);
     try
@@ -182,14 +189,20 @@ static HANDLE OpenPipeClient(const std::wstring& pipeName, DWORD access)
             pipeName.c_str(), access, 0, nullptr, OPEN_EXISTING,
             FILE_FLAG_OVERLAPPED, nullptr);
         if (h != INVALID_HANDLE_VALUE) return h;
-        if (GetLastError() != ERROR_PIPE_BUSY) return INVALID_HANDLE_VALUE;
+        const DWORD error = GetLastError();
+        if (error != ERROR_PIPE_BUSY && error != ERROR_FILE_NOT_FOUND) return INVALID_HANDLE_VALUE;
 
         const ULONGLONG now = GetTickCount64();
         if (now >= deadline) return INVALID_HANDLE_VALUE;
+        if (error == ERROR_FILE_NOT_FOUND)
+        {
+            Sleep(static_cast<DWORD>((std::min<ULONGLONG>)(50, deadline - now)));
+            continue;
+        }
         const DWORD remaining = static_cast<DWORD>(std::min<ULONGLONG>(
             deadline - now, static_cast<ULONGLONG>(protocol::WAITSERVER_BUSY)));
         if (!WaitNamedPipeW(pipeName.c_str(), remaining)
-            && GetLastError() != ERROR_SEM_TIMEOUT)
+            && GetLastError() != ERROR_SEM_TIMEOUT && GetLastError() != ERROR_FILE_NOT_FOUND)
         {
             return INVALID_HANDLE_VALUE;
         }
@@ -216,6 +229,8 @@ static bool ReadPipeOverlapped(HANDLE pipe, void* buf, DWORD len, DWORD& bytesRe
             }
             else
             {
+                CancelIoEx(pipe, &ov);
+                GetOverlappedResult(pipe, &ov, &bytesRead, TRUE);
                 ok = FALSE;
             }
         }
@@ -231,8 +246,9 @@ static bool ReadPipeOverlapped(HANDLE pipe, void* buf, DWORD len, DWORD& bytesRe
 }
 // 重叠 I/O 写入（阻塞等待完成）
 // 与 ReadPipeOverlapped 同理 保证挂起的读不阻塞本写入
-static bool WritePipeOverlapped(HANDLE pipe, const void* buf, DWORD len)
+static bool WritePipeOverlapped(HANDLE pipe, const void* buf, DWORD len, ULONGLONG deadline)
 {
+    if (GetTickCount64() >= deadline) return false;
     OVERLAPPED ov{};
     ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (ov.hEvent == nullptr) return false;
@@ -243,12 +259,18 @@ static bool WritePipeOverlapped(HANDLE pipe, const void* buf, DWORD len)
     {
         if (GetLastError() == ERROR_IO_PENDING)
         {
-            if (WaitForSingleObject(ov.hEvent, INFINITE) == WAIT_OBJECT_0)
+            const ULONGLONG now = GetTickCount64();
+            const DWORD remaining = now < deadline ? static_cast<DWORD>(deadline - now) : 0;
+            if (WaitForSingleObject(ov.hEvent, remaining) == WAIT_OBJECT_0)
             {
                 ok = GetOverlappedResult(pipe, &ov, &written, FALSE);
             }
             else
             {
+                // Cancellation is asynchronous: keep ov, its event and buf alive
+                // until the operation has completed, even on the timeout path.
+                CancelIoEx(pipe, &ov);
+                GetOverlappedResult(pipe, &ov, &written, TRUE);
                 ok = FALSE;
             }
         }
@@ -314,11 +336,12 @@ bool PipeChannel::SendFrame(uint8_t type, const void* data, uint32_t len)
         header[4] = static_cast<uint8_t>((len >> 24) & 0xFF);
 
         // 写帧头（重叠 I/O 挂起的读不会阻塞本写入）
-        success = WritePipeOverlapped(pipe, header, protocol::HEADER_SIZE);
+        const ULONGLONG deadline = GetTickCount64() + WRITE_TIMEOUT_MS;
+        success = WritePipeOverlapped(pipe, header, protocol::HEADER_SIZE, deadline);
 
         // 写负载
         if (success && len > 0)
-            success = WritePipeOverlapped(pipe, data, len);
+            success = WritePipeOverlapped(pipe, data, len, deadline);
     }
 
     // 写失败后立即把句柄标为断开，避免后续线程继续拼接半个协议帧。
@@ -341,7 +364,7 @@ bool PipeChannel::SendReady(const char* statusMsg)
     // 例如 "IL2CPP resolved: 42 images, Lua ready"
     const char* msg = (statusMsg != nullptr) ? statusMsg : "ready";
     const size_t length = strnlen_s(msg, protocol::MAX_PAYLOAD + 1);
-    FlushLogs();
+    if (!FlushLogs()) return false;
     return length <= protocol::MAX_PAYLOAD
         && SendFrame(protocol::MSG_READY, msg, static_cast<uint32_t>(length));
 }
@@ -352,7 +375,12 @@ bool PipeChannel::SendLog(const char* text)
     if (m_stopping.load(std::memory_order_acquire)) return false;
 
     const size_t length = strnlen_s(text, MAX_LOG_QUEUE_BYTES + 1);
-    if (length > MAX_LOG_QUEUE_BYTES) return false;
+    const auto dropped = [this, length] {
+        m_rejectedLogBatches.fetch_add(1, std::memory_order_relaxed);
+        m_droppedLogBytes.fetch_add(length, std::memory_order_relaxed);
+        return false;
+    };
+    if (length > MAX_LOG_QUEUE_BYTES) return dropped();
     // UTF-8 字符最多占 4 字节；预留帧数考虑末尾最多回退 3 字节。
     const size_t chunks = length == 0 ? 1 : (length + MAX_LOG_LENGTH - 4) / (MAX_LOG_LENGTH - 3);
 
@@ -361,24 +389,36 @@ bool PipeChannel::SendLog(const char* text)
     try
     {
         std::lock_guard<std::mutex> lock(m_logMutex);
-        if (m_logStopping || chunks > MAX_LOG_QUEUE_ITEMS - m_logQueue.size()
-            || length > MAX_LOG_QUEUE_BYTES - m_logQueueBytes) return false;
-        size_t offset = 0;
-        do
+        if (m_logStopping || m_logFailed || chunks > MAX_LOG_QUEUE_ITEMS - m_logQueue.size()
+            || length > MAX_LOG_QUEUE_BYTES - m_logQueueBytes) return dropped();
+        const size_t previousSize = m_logQueue.size();
+        const size_t previousBytes = m_logQueueBytes;
+        try
         {
-            size_t bytes = (std::min)(MAX_LOG_LENGTH, length - offset);
-            if (offset + bytes < length)
-                while (bytes > 0 && (static_cast<unsigned char>(text[offset + bytes]) & 0xC0) == 0x80) --bytes;
-            // 非 UTF-8 输入仍保证有进展；正常 UTF-8 不会走到这里。
-            if (bytes == 0 && offset < length) bytes = (std::min)(MAX_LOG_LENGTH, length - offset);
-            m_logQueue.emplace_back(text + offset, bytes);
-            m_logQueueBytes += bytes;
-            offset += bytes;
-        } while (offset < length);
+            size_t offset = 0;
+            do
+            {
+                size_t bytes = (std::min)(MAX_LOG_LENGTH, length - offset);
+                if (offset + bytes < length)
+                    while (bytes > 0 && (static_cast<unsigned char>(text[offset + bytes]) & 0xC0) == 0x80) --bytes;
+                // 非 UTF-8 输入仍保证有进展；正常 UTF-8 不会走到这里。
+                if (bytes == 0 && offset < length) bytes = (std::min)(MAX_LOG_LENGTH, length - offset);
+                m_logQueue.emplace_back(text + offset, bytes);
+                m_logQueueBytes += bytes;
+                offset += bytes;
+            } while (offset < length);
+        }
+        catch (...)
+        {
+            while (m_logQueue.size() > previousSize) m_logQueue.pop_back();
+            m_logQueueBytes = previousBytes;
+            return dropped();
+        }
+        m_logAccepted += m_logQueue.size() - previousSize;
     }
     catch (...)
     {
-        return false;
+        return dropped();
     }
     m_logReady.notify_one();
     return true;
@@ -390,7 +430,7 @@ bool PipeChannel::SendError(protocol::ErrorCategory category, int32_t line, cons
     const char* msg = (text != nullptr) ? text : "unknown error";
     std::vector<uint8_t> payload;
     if (!protocol::EncodeErrorPayload(category, line, msg, payload)) return false;
-    FlushLogs();
+    if (!FlushLogs()) return false;
     return SendFrame(protocol::MSG_ERROR, payload.data(), static_cast<uint32_t>(payload.size()));
 }
 
@@ -399,7 +439,7 @@ bool PipeChannel::SendOk()
 {
     // 发送 MSG_OK 帧 无负载
     // 用于通知 EXE 命令执行成功
-    FlushLogs();
+    if (!FlushLogs()) return false;
     return SendFrame(protocol::MSG_OK, nullptr, 0);
 }
 // 发送退出帧
@@ -407,7 +447,7 @@ bool PipeChannel::SendExit()
 {
     // 发送 MSG_EXIT 帧 无负载
     // 通知 EXE 即将断开连接（DLL 卸载）
-    FlushLogs();
+    if (!FlushLogs()) return false;
     return SendFrame(protocol::MSG_EXIT, nullptr, 0);
 }
 // 接收帧（阻塞）
@@ -545,6 +585,8 @@ void PipeChannel::MarkDisconnected(HANDLE pipe)
         if (m_pipe == pipe)
         {
             m_connected = false;
+            // Wake a pending reader even when EndRead owns final closure.
+            CancelIoEx(pipe, nullptr);
             // 活动读操作结束前保留句柄；EndRead 会负责最后关闭。
             if (m_activeReads == 0)
             {
@@ -578,24 +620,35 @@ void PipeChannel::LogWorker()
             m_logWriting = true;
         }
 
-        // SendFrame 只负责协议和句柄同步；日志线程是唯一的日志发送者，
-        // 失败后丢弃当前消息，后续消息仍可继续尝试。
-        SendFrame(protocol::MSG_LOG, message.data(), static_cast<uint32_t>(message.size()));
+        // 日志线程是唯一的日志发送者；失败会终止本连接的消费并唤醒 flush。
+        const bool sent = SendFrame(protocol::MSG_LOG, message.data(), static_cast<uint32_t>(message.size()));
 
         {
             std::lock_guard<std::mutex> lock(m_logMutex);
             m_logWriting = false;
-            if (m_logQueue.empty()) m_logDrained.notify_all();
+            if (sent) ++m_logCompleted;
+            else
+            {
+                m_logFailed = true;
+                m_discardedLogFrames.fetch_add(1 + m_logQueue.size(), std::memory_order_relaxed);
+                m_droppedLogBytes.fetch_add(message.size() + m_logQueueBytes, std::memory_order_relaxed);
+                m_logQueue.clear();
+                m_logQueueBytes = 0;
+            }
+            m_logDrained.notify_all();
         }
+        if (!sent) return;
     }
 }
 
-void PipeChannel::FlushLogs()
+bool PipeChannel::FlushLogs()
 {
     std::unique_lock<std::mutex> lock(m_logMutex);
-    m_logDrained.wait(lock, [this] {
-        return m_logStopping || (m_logQueue.empty() && !m_logWriting);
+    const uint64_t target = m_logAccepted;
+    const bool completed = m_logDrained.wait_for(lock, std::chrono::milliseconds(WRITE_TIMEOUT_MS), [this, target] {
+        return m_logStopping || m_logFailed || m_logCompleted >= target;
     });
+    return completed && !m_logStopping && !m_logFailed && m_logCompleted >= target;
 }
 
 void PipeChannel::StopLogWorker()
@@ -603,9 +656,12 @@ void PipeChannel::StopLogWorker()
     {
         std::lock_guard<std::mutex> lock(m_logMutex);
         m_logStopping = true;
+        m_discardedLogFrames.fetch_add(m_logQueue.size(), std::memory_order_relaxed);
+        m_droppedLogBytes.fetch_add(m_logQueueBytes, std::memory_order_relaxed);
         m_logQueue.clear();
         m_logQueueBytes = 0;
     }
     m_logReady.notify_all();
+    m_logDrained.notify_all();
     if (m_logThread.joinable()) m_logThread.join();
 }

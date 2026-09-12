@@ -117,6 +117,8 @@ static int Field_Read(lua_State* L)
 int LuaBridge_ReadField(lua_State* L, Il2CppObject* obj, const Il2CppField* field)
 {
     auto& resolver = Il2CppResolver::Instance();
+    if (!resolver.CanUseClass(resolver.GetFieldClass(field)))
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "unsupported field declaring class (open/Nullable or unavailable metadata)");
     const auto* type = resolver.GetFieldType(field);
     const size_t size = LuaBridge_GetValueStorageSize(type);
     if (size == 0) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "unsupported field type");
@@ -134,6 +136,8 @@ int LuaBridge_ReadField(lua_State* L, Il2CppObject* obj, const Il2CppField* fiel
 int LuaBridge_WriteField(lua_State* L, Il2CppObject* obj, const Il2CppField* field, int valueIndex)
 {
     auto& resolver = Il2CppResolver::Instance();
+    if (!resolver.CanUseClass(resolver.GetFieldClass(field)))
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "unsupported field declaring class (open/Nullable or unavailable metadata)");
     valueIndex = lua_absindex(L, valueIndex);
     if ((resolver.GetFieldFlags(field) & 0x0040) != 0)
         return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "const field cannot be written");

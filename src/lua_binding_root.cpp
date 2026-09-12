@@ -7,9 +7,11 @@
 #include "lua_binding_internal.h"
 #include "il2cpp_hook.h"
 #include "il2cpp_scheduler.h"
+#include "pipe_channel.h"
 #include <windows.h>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 // il2cpp 全局表函数
 // il2cpp.get_status() → string 导出函数的解析状态
 static int Il2Cpp_GetStatus(lua_State* L)
@@ -30,6 +32,9 @@ static int Il2Cpp_GetStatus(lua_State* L)
     status += Il2CppScheduler::IsReady() ? "ready\n" : "not ready\n";
     status += "GameAssembly: ";
     status += gameAssembly != nullptr ? moduleBase : "not loaded";
+    status += "\nRejected log batches: " + std::to_string(PipeChannel::Instance().GetRejectedLogBatches());
+    status += "\nDiscarded log frames: " + std::to_string(PipeChannel::Instance().GetDiscardedLogFrames());
+    status += "\nDropped log bytes (lower bound): " + std::to_string(PipeChannel::Instance().GetDroppedLogBytes());
 
     lua_pushlstring(L, status.c_str(), status.size());
 
@@ -156,7 +161,7 @@ static int Lua_Each(lua_State* L)
 // 向 dump 缓冲追加格式化文本
 void LuaBridge_DumpAppend(DumpBuffer* buf, const char* fmt, ...)
 {
-    if (buf == nullptr || buf->len >= sizeof(buf->data)) return;
+    if (buf == nullptr || buf->truncated) return;
 
     va_list args;
     va_start(args, fmt);
@@ -166,6 +171,16 @@ void LuaBridge_DumpAppend(DumpBuffer* buf, const char* fmt, ...)
 
     size_t room = sizeof(buf->data) - buf->len;
     buf->len += static_cast<size_t>(n) < room ? static_cast<size_t>(n) : room - 1;
+    if (static_cast<size_t>(n) >= room)
+    {
+        buf->truncated = true;
+        constexpr char marker[] = "\n[dump truncated]\n";
+        size_t end = sizeof(buf->data) - sizeof(marker);
+        while (end > 0 && (static_cast<unsigned char>(buf->data[end]) & 0xC0) == 0x80) --end;
+        // Pad the reserved tail so len remains a stable full-buffer sentinel.
+        memset(buf->data + end, ' ', sizeof(buf->data) - sizeof(marker) - end);
+        memcpy(buf->data + sizeof(buf->data) - sizeof(marker), marker, sizeof(marker));
+    }
 }
 
 void LuaBridge_PrintDump(lua_State* L, const DumpBuffer* buffer)
@@ -209,6 +224,7 @@ static int Lua_Dump(lua_State* L)
     // 输出缓冲作为回调闭包的 upvalue
     DumpBuffer* buf = static_cast<DumpBuffer*>(lua_newuserdata(L, sizeof(DumpBuffer)));
     buf->len = 0;
+    buf->truncated = false;
     lua_pushcclosure(L, DumpFormatCallback, 1);
     int fnIdx = lua_gettop(L);
 
@@ -266,7 +282,9 @@ static int Il2Cpp_Schedule(lua_State* L)
 {
     if (!lua_isfunction(L, 1)) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "expected function as argument");
 
-    Il2CppScheduler::Schedule(L, 1);
+    if (!Il2CppScheduler::Schedule(L, 1))
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp,
+            "schedule queue full (max 1024 pending tasks) or allocation failed");
     return 0;
 }
 

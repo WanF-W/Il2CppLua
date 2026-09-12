@@ -33,6 +33,7 @@ namespace
     // schedule 可能从 CLI 线程或 Hook 回调线程进入，因此单独加锁。
     std::mutex g_queueMutex;
     std::deque<int> g_queue;
+    constexpr size_t MAX_PENDING_TASKS = 1024;
 
     // tick 元数据与安装过程分开保护：读取状态不需要阻塞队列操作，
     // 替换 Hook 则必须串行，防止两个调用者交叉禁用同一个 tick。
@@ -56,14 +57,27 @@ namespace
 
 bool Il2CppScheduler::Schedule(lua_State* L, int callbackIndex)
 {
+    LuaEngine::Instance().RequireHealthy();
     if (L == nullptr || !lua_isfunction(L, callbackIndex)) return false;
 
     // registry 引用使回调在真正执行前不会被 Lua GC 回收。
     lua_pushvalue(L, callbackIndex);
     const int reference = luaL_ref(L, LUA_REGISTRYINDEX);
+    bool queued = false;
+    try
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
-        g_queue.push_back(reference);
+        if (g_queue.size() < MAX_PENDING_TASKS)
+        {
+            g_queue.push_back(reference);
+            queued = true;
+        }
+    }
+    catch (...) { /* Release the registry reference outside the queue lock. */ }
+    if (!queued)
+    {
+        luaL_unref(L, LUA_REGISTRYINDEX, reference);
+        return false;
     }
 
     // 入队与安装解耦：安装失败时保留任务，用户随后 set_tick 成功后仍可执行。
@@ -138,6 +152,7 @@ bool Il2CppScheduler::EnsureInstalled()
 
 void Il2CppScheduler::Drain(lua_State* L)
 {
+    LuaEngine::Instance().RequireHealthy();
     if (L == nullptr || g_draining) return;
 
     DWORD mainId = g_mainThreadId.load(std::memory_order_relaxed);
@@ -172,6 +187,7 @@ void Il2CppScheduler::Drain(lua_State* L)
         LuaEngine::OutputCapture outputCapture;
         LuaEngine::Instance().BeginOutputCapture(outputCapture);
         const int status = lua_pcall(L, 0, 0, 0);
+        LuaEngine::Instance().RequireHealthy();
         LuaEngine::Instance().EndOutputCapture(outputCapture);
 
         if (status != LUA_OK)
@@ -189,6 +205,7 @@ void Il2CppScheduler::Drain(lua_State* L)
 
 void Il2CppScheduler::Shutdown(lua_State* L)
 {
+    if (LuaEngine::Instance().IsFaulted()) return;
     // Shutdown 在 Lua VM 仍有效时调用，因此可以安全释放 registry 引用。
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);

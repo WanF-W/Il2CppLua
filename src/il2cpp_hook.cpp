@@ -134,21 +134,21 @@ extern "C" std::atomic<int64_t> g_activeDetours{0};
 static bool g_tickInstalled = false;
 static uint32_t g_tickHookId = UINT32_MAX;
 
-// thunk 大小（mov eax,imm32 + jmp [rip+0] + 8 字节地址，共 19 字节）
-constexpr uint32_t HOOK_THUNK_SIZE = 19;
+// mov r11,trampoline-slot + mov eax,id + absolute entry jump + trampoline slot.
+constexpr uint32_t HOOK_THUNK_SIZE = 37;
 
 // 汇编入口只传递 hookId。这里仅获取条目保存的 trampoline 作为回退标志；
 // 原方法实际由 InvokeOriginalFallback 在 C++ 中执行。
-static void* LookupOriginal(uint64_t hookId)
-{
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (hookId >= g_entries.size()) return nullptr;
-    const HookEntry* entry = g_entries[static_cast<size_t>(hookId)].get();
-    return entry != nullptr ? entry->original : nullptr;
-}
 static HookEntry* LookupEntry(uint64_t hookId)
 {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    // A fault may have abandoned an installation holding the registry mutex.
+    // Existing game callers must escape that wait and bypass Lua instead.
+    std::unique_lock<std::mutex> lock(g_mutex, std::defer_lock);
+    while (!lock.try_lock())
+    {
+        if (LuaEngine::Instance().IsFaulted()) return nullptr;
+        Sleep(1);
+    }
     if (hookId >= g_entries.size()) return nullptr;
     return g_entries[static_cast<size_t>(hookId)].get();
 }
@@ -171,6 +171,7 @@ static bool EnsureMinHookInitialized()
 }
 // 内部工具：thunk 分配
 // thunk 机器码:
+//   49 BB <slot64>       mov r11, trampoline-slot
 //   B8 <id32>            mov eax, imm32     ; 传递 hookId
 //   FF 25 00000000       jmp qword ptr [rip+0]
 //   <detour 地址 8 字节>  ; 绝对跳转到 HookDetourEntry
@@ -180,23 +181,31 @@ static void* AllocateThunk(uint32_t hookId, void* detour)
         nullptr, HOOK_THUNK_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (mem == nullptr) return nullptr;
 
-    // mov eax, imm32
-    mem[0] = 0xB8;
-    memcpy(mem + 1, &hookId, sizeof(uint32_t));
+    // The trampoline slot is published after MH_CreateHook, before enabling.
+    mem[0] = 0x49;
+    mem[1] = 0xBB;
+    void* trampolineSlot = mem + 29;
+    memcpy(mem + 2, &trampolineSlot, sizeof(void*));
+    memset(mem + 29, 0, sizeof(void*));
+    mem[10] = 0xB8;
+    memcpy(mem + 11, &hookId, sizeof(uint32_t));
 
     // jmp qword ptr [rip + 0]
-    mem[5] = 0xFF;
-    mem[6] = 0x25;
-    mem[7] = 0x00;
-    mem[8] = 0x00;
-    mem[9] = 0x00;
-    mem[10] = 0x00;
+    mem[15] = 0xFF;
+    mem[16] = 0x25;
+    memset(mem + 17, 0, 4);
 
     // 紧跟指令的绝对地址
-    memcpy(mem + 11, &detour, sizeof(void*));
+    memcpy(mem + 21, &detour, sizeof(void*));
 
     FlushInstructionCache(GetCurrentProcess(), mem, HOOK_THUNK_SIZE);
     return mem;
+}
+
+static void PublishTrampoline(HookEntry* entry)
+{
+    memcpy(static_cast<uint8_t*>(entry->thunk) + 29, &entry->original, sizeof(void*));
+    FlushInstructionCache(GetCurrentProcess(), entry->thunk, HOOK_THUNK_SIZE);
 }
 
 // 填充用户 Hook 与内部 tick 共用的方法元数据。
@@ -211,7 +220,7 @@ static bool PopulateHookMetadata(
     entry->method = method;
     entry->klass = resolver.GetMethodClass(method);
     if (entry->klass == nullptr) entry->klass = fallbackClass;
-    if (entry->klass == nullptr) return false;
+    if (!resolver.CanInvokeMethod(method)) return false;
     entry->isStatic = resolver.IsStaticMethod(method);
     entry->isValueTypeClass = resolver.IsValueType(entry->klass)
         || resolver.IsEnum(entry->klass);
@@ -304,6 +313,7 @@ static bool TryInstallTickHook(const Il2CppMethod* method, Il2CppClass* klass)
         return false;
     }
 
+    PublishTrampoline(entry.get());
     status = MH_EnableHook(target);
     if (status != MH_OK)
     {
@@ -363,7 +373,11 @@ static uint32_t NativeStackCount(const HookEntry* e)
 static bool CallNativeSafe(NativeHookContext* call, uint32_t stackCount)
 {
     __try { NativeInvoke(call, stackCount); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    // A C++ exception from the original call can be handled while Lua frames
+    // remain intact. Native faults and poisoned nested Hooks must escape.
+    __except (GetExceptionCode() == 0xE06D7363 && !LuaEngine::Instance().IsFaulted()
+        ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) { return false; }
+    LuaEngine::Instance().RequireHealthy();
     return true;
 }
 
@@ -453,7 +467,7 @@ static int OriginalInvoke(lua_State* L)
             memset(reinterpret_cast<void*>(st->ctx->rcx), 0, e->returnSize);
             st->ctx->resultInt = st->ctx->rcx;
         }
-        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "original: native or managed exception; invocation was not repeated");
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "original: C++ exception from native invocation; invocation was not repeated");
     }
     if (e->largeReturn)
         memcpy(reinterpret_cast<void*>(st->ctx->rcx), reinterpret_cast<void*>(call.rcx), e->returnSize);
@@ -588,6 +602,7 @@ static bool InvokePinnedCallback(lua_State* L, const HookEntry* e, int pinRef, N
     LuaEngine::OutputCapture outputCapture;
     LuaEngine::Instance().BeginOutputCapture(outputCapture);
     int status = lua_pcall(L, nargs, nresults, 0);
+    LuaEngine::Instance().RequireHealthy();
     LuaEngine::Instance().EndOutputCapture(outputCapture);
 
     // 回调结束后 original 闭包失效
@@ -624,31 +639,32 @@ static bool InvokePinnedCallback(lua_State* L, const HookEntry* e, int pinRef, N
 // 分发器（SEH 安全壳）
 // HookDetourEntry 汇编跳板调用此函数
 // __try/__except 捕获参数编组/回调过程中的访问违例
-// 任何异常都在 C++ 中安全回退到 trampoline；汇编跳板只返回已编组的结果。
+// 原生故障隔离 VM；嵌套故障继续展开，最外层仅在尚未调用原方法时由汇编透传。
 extern "C" void HookDispatch(NativeHookContext* ctx)
 {
     if (ctx == nullptr) return;
-
-    // 这些字段必须在进入 __try 前初始化，因为异常处理器也会读取它们。
-    // original 只作为当前上下文的回退标志；汇编不会直接调用该地址。
     ctx->reserved = 0;
-    ctx->original = LookupOriginal(ctx->hookId);
-
+    void** originalSlot = static_cast<void**>(ctx->original);
+    const bool nested = LuaEngine::EnterExecution();
     __try
     {
-        DispatchSafe(ctx);
+        __try
+        {
+            ctx->original = *originalSlot;
+            DispatchSafe(ctx);
+        }
+        __except ((LuaEngine::Instance().Quarantine(GetExceptionCode()),
+            nested ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER))
+        {
+            // No VM/registry access or retry of an original already entered.
+            // Otherwise the assembly epilogue restores arguments and bypasses Lua.
+            if ((ctx->reserved & 4) != 0) ctx->original = nullptr;
+        }
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __finally
     {
-        // SEH 不会执行 OutputCapture 的 C++ 清理；先清掉线程本地捕获指针，
-        // 避免后续 Hook 输出访问已经离开作用域的批次缓冲区。
-        LuaEngine::Instance().AbortOutputCapture();
-
-        // 恢复显式锁（SEH 不会替 C++ 执行 RAII 析构）。完整 detour
-        // 计数由汇编入口维护，因此异常路径也不会绕过卸载等待。
         if ((ctx->reserved & 0x2) != 0)
         {
-            // DispatchSafe 可能在 registry lock 内发生访问违例。
             g_mutex.unlock();
             ctx->reserved &= ~0x2;
         }
@@ -657,35 +673,36 @@ extern "C" void HookDispatch(NativeHookContext* ctx)
             LuaEngine::Instance().GetMutex().unlock();
             ctx->reserved &= ~0x1;
         }
-        // 不把仍在 detour 栈帧中的 trampoline 交给汇编直接调用。即使异常发生在
-        // 参数编组阶段，也尝试通过 trampoline 回退；失败时返回默认值。
-        HookEntry* entry = LookupEntry(ctx->hookId);
-        if (!g_shutdown.load(std::memory_order_acquire))
-            InvokeOriginalFallback(entry, ctx);
-        ctx->original = nullptr;
-        PipeChannel::Instance().SendLog("[hook] access violation in hook dispatcher\n");
+        LuaEngine::LeaveExecution();
+        if (ctx->original != nullptr) ctx->original = originalSlot;
+        // Escaping SEH skips the assembly epilogue. The module is quarantined
+        // before unwinding, so it cannot unload while this frame still exists.
+        if (AbnormalTermination()) g_activeDetours.fetch_sub(1, std::memory_order_acq_rel);
     }
 }
 
 // 实际分发逻辑（不能在 __try 函数中出现需要展开的 C++ 对象）
-// 原方法回退统一由 NativeInvoke 完成，避免与当前 detour 栈帧重叠。
+// 正常原方法回退由 NativeInvoke 完成；隔离和内部类型查询由汇编透传。
 static void DispatchSafe(NativeHookContext* ctx)
 {
     // 异常恢复标志（供 HookDispatch 的 __except 使用）。bit 0 表示 Lua
     // 锁，bit 1 表示 registry 锁；两把锁都使用显式路径管理。
     ctx->reserved = 0;
 
+    auto& engine = LuaEngine::Instance();
+    if (engine.IsFaulted() || Il2CppResolver::IsTypeQueryActive()) return;
     HookEntry* e = LookupEntry(ctx->hookId);
+    if (engine.IsFaulted()) return;
     int pinRef = LUA_REFNIL;
     bool ok = false;
     bool isTick = false;
 
-    auto& engine = LuaEngine::Instance();
     if (g_shutdown.load(std::memory_order_acquire))
     {
         // Shutdown 只会在完整 detour 计数归零后释放条目；当前调用仍可在
         // 不触碰 Lua 的情况下执行原方法，避免卸载窗口返回错误的默认值。
         e = LookupEntry(ctx->hookId);
+        if (engine.IsFaulted()) return;
         if (e != nullptr && ctx->original != nullptr)
             InvokeOriginalFallback(e, ctx);
         ctx->original = nullptr;
@@ -704,19 +721,27 @@ static void DispatchSafe(NativeHookContext* ctx)
     // 锁顺序固定: Lua 互斥锁 -> Hook 注册表
     // LuaEngine 使用可重入互斥锁 回调内再次触发 Hook 不会死锁
     // 手动加锁/解锁 保证 SEH 异常时可以在 __except 中恢复
-    engine.GetMutex().lock();
+    while (!engine.GetMutex().try_lock())
+    {
+        if (engine.IsFaulted()) return;
+        Sleep(1);
+    }
     ctx->reserved |= 0x1;
     lua_State* L = engine.GetState();
     if (L == nullptr || !engine.IsInitialized()) goto cleanup;
 
-    g_mutex.lock();
+    while (!g_mutex.try_lock())
+    {
+        if (engine.IsFaulted()) goto cleanup;
+        Sleep(1);
+    }
     ctx->reserved |= 0x2;
 
     if (ctx->hookId >= g_entries.size()) goto cleanup;
     e = g_entries[ctx->hookId].get();
     if (e == nullptr) goto cleanup;
 
-    // 记录当前条目状态；汇编不再直接调用 trampoline。
+    // 记录正常分发使用的 trampoline；汇编透传使用 thunk 中的稳定槽位。
     ctx->original = e->original;
 
     // 关闭中/未启用 -> 由 cleanup 在 C++ 中回退原方法。
@@ -764,7 +789,9 @@ unlocked:
 
     // Scheduler 负责确认当前线程并排空队列。用户回调与 tick 共存时，
     // 先完成当前方法回调，再执行排队的主线程任务。
+    engine.RequireHealthy();
     if (isTick) Il2CppScheduler::Drain(L);
+    engine.RequireHealthy();
 
     // 释放 pin 引用
     if (pinRef != LUA_REFNIL) luaL_unref(L, LUA_REGISTRYINDEX, pinRef);
@@ -781,6 +808,11 @@ cleanup:
         ctx->reserved &= ~0x1;
     }
 
+    if (engine.IsFaulted())
+    {
+        if ((ctx->reserved & 4) != 0) ctx->original = nullptr;
+        return;
+    }
     if (e != nullptr && ctx->original != nullptr)
     {
         InvokeOriginalFallback(e, ctx);
@@ -896,6 +928,7 @@ bool Il2CppHook::HookMethod(lua_State* L, const Il2CppMethod* method, Il2CppClas
         return false;
     }
 
+    PublishTrampoline(entry.get());
     status = MH_EnableHook(target);
     if (status != MH_OK)
     {
@@ -1003,14 +1036,21 @@ bool Il2CppHook::IsSchedulerTickInstalled()
 // 公共 API：关闭模块
 void Il2CppHook::Shutdown()
 {
-    lua_State* L = LuaEngine::Instance().GetState();
+    auto& engine = LuaEngine::Instance();
+    if (engine.IsFaulted()) return;
 
     // 先置关闭标志 阻止新的回调进入 Lua
     g_shutdown = true;
 
     // 禁用全部 Hook（MinHook API 本身线程安全）
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
+        std::unique_lock<std::mutex> lock(g_mutex, std::defer_lock);
+        while (!lock.try_lock())
+        {
+            if (engine.IsFaulted()) return;
+            Sleep(1);
+        }
+        if (engine.IsFaulted()) return;
         for (auto& entry : g_entries)
         {
             if (entry->target != nullptr) MH_DisableHook(entry->target);
@@ -1019,13 +1059,25 @@ void Il2CppHook::Shutdown()
 
     // 等待完整 detour 全部结束。计数覆盖汇编入口、Lua 分发和原方法回退，
     // 因此条目与 MinHook 资源不会在仍有线程执行时被释放。
-    std::unique_lock<std::mutex> lock(g_mutex);
+    std::unique_lock<std::mutex> lock(g_mutex, std::defer_lock);
+    while (!lock.try_lock())
+    {
+        if (engine.IsFaulted()) return;
+        Sleep(1);
+    }
     while (g_activeDetours.load(std::memory_order_acquire) != 0)
     {
         lock.unlock();
+        if (engine.IsFaulted()) return;
         Sleep(10);
-        lock.lock();
+        while (!lock.try_lock())
+        {
+            if (engine.IsFaulted()) return;
+            Sleep(1);
+        }
     }
+    if (engine.IsFaulted()) return;
+    lua_State* L = engine.GetState();
 
     // 释放 Lua 引用与 thunk 并清空条目
     for (auto& entry : g_entries)

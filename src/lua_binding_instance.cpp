@@ -142,6 +142,7 @@ static int Instance_DumpContainer(
 
     DumpBuffer* buffer = static_cast<DumpBuffer*>(lua_newuserdata(L, sizeof(DumpBuffer)));
     buffer->len = 0;
+    buffer->truncated = false;
     LuaBridge_DumpAppend(buffer, "%s: %s\n", isArray ? "Array" : "List",
         typeName != nullptr ? typeName : "?");
     LuaBridge_DumpAppend(buffer, "count: %lld\n", static_cast<long long>(count));
@@ -182,6 +183,7 @@ static int Instance_Dump(lua_State* L)
 
     DumpBuffer* buffer = static_cast<DumpBuffer*>(lua_newuserdata(L, sizeof(DumpBuffer)));
     buffer->len = 0;
+    buffer->truncated = false;
     LuaBridge_DumpAppend(buffer, "Instance: %s%s%s\n",
         namespaze != nullptr && namespaze[0] != '\0' ? namespaze : "",
         namespaze != nullptr && namespaze[0] != '\0' ? "." : "",
@@ -201,17 +203,19 @@ static int Instance_Dump(lua_State* L)
     }
 
     constexpr int32_t MAX_FIELDS = 1024;
-    auto** fields = static_cast<const Il2CppField**>(LuaBridge_NewBuffer(L, sizeof(Il2CppField*) * MAX_FIELDS));
+    auto** fields = static_cast<const Il2CppField**>(LuaBridge_NewBuffer(L, sizeof(Il2CppField*) * (MAX_FIELDS + 1)));
     for (int classIndex = 0; classIndex < classCount; ++classIndex)
     {
         Il2CppClass* klass = classes[classIndex];
         const char* classNamespace = resolver.GetClassNamespace(klass);
         const char* className = resolver.GetClassSimpleName(klass);
         const int32_t fieldCount = resolver.EnumerateFields(
-            klass, fields, MAX_FIELDS);
+            klass, fields, MAX_FIELDS + 1);
 
+        if (fieldCount > MAX_FIELDS)
+            LuaBridge_DumpAppend(buffer, "[fields truncated: first 1024 declared fields]\n");
         int32_t instanceFieldCount = 0;
-        for (int32_t i = 0; i < fieldCount; ++i)
+        for (int32_t i = 0; i < fieldCount && i < MAX_FIELDS; ++i)
         {
             if (!resolver.IsStaticField(fields[i])) ++instanceFieldCount;
         }
@@ -221,7 +225,7 @@ static int Instance_Dump(lua_State* L)
             classNamespace != nullptr && classNamespace[0] != '\0' ? "." : "",
             className != nullptr ? className : "?", instanceFieldCount);
 
-        for (int32_t i = 0; i < fieldCount; ++i)
+        for (int32_t i = 0; i < fieldCount && i < MAX_FIELDS; ++i)
         {
             // 静态字段不属于某个实例，只能通过 Class 的静态字段值接口读取。
             if (resolver.IsStaticField(fields[i])) continue;

@@ -184,6 +184,8 @@ int64_t LuaBridge_GetListCount(Il2CppObject* list, Il2CppClass* klass)
 static int PushListElement(lua_State* L, Il2CppObject* list, const Il2CppMethod* method, int64_t index)
 {
     auto& resolver = Il2CppResolver::Instance();
+    if (!resolver.CanInvokeMethod(method))
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "unsupported List element getter (open/Nullable or unavailable metadata)");
     int32_t managedIndex = static_cast<int32_t>(index);
     void* args[] = { &managedIndex };
     Il2CppException* exception = nullptr;
@@ -222,12 +224,8 @@ void LuaBridge_EachArray(lua_State* L, Il2CppObject* arr, int fnIdx, int64_t& ou
         int status = lua_pcall(L, 2, 0, 0);
         if (status != LUA_OK)
         {
-            const char* err = lua_tostring(L, -1);
-            char errBuf[512];
-            snprintf(errBuf, sizeof(errBuf), "each callback error: %s", err ? err : "(non-string error)");
-            lua_pop(L, 1);      // 错误
-            lua_pop(L, 1);      // value
-            LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "%s", errBuf);
+            // The error object stays on top; Lua unwinds this C frame.
+            lua_error(L);
             return;
         }
         lua_pop(L, 1);          // value
@@ -266,12 +264,8 @@ void LuaBridge_EachList(lua_State* L, Il2CppObject* list, Il2CppClass* klass, in
         int status = lua_pcall(L, 2, 0, 0);
         if (status != LUA_OK)
         {
-            const char* err = lua_tostring(L, -1);
-            char errBuf[512];
-            snprintf(errBuf, sizeof(errBuf), "each callback error: %s", err ? err : "(non-string error)");
-            lua_pop(L, 1);      // 错误
-            lua_pop(L, 1);      // value
-            LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "%s", errBuf);
+            // The error object stays on top; Lua unwinds this C frame.
+            lua_error(L);
             return;
         }
         lua_pop(L, 1);          // value
@@ -307,12 +301,8 @@ int LuaBridge_EachTable(lua_State* L, int tblIdx, int fnIdx)
         lua_pushinteger(L, i);
         if (lua_pcall(L, 2, 0, 0) != LUA_OK)
         {
-            const char* err = lua_tostring(L, -1);
-            char errBuf[512];
-            snprintf(errBuf, sizeof(errBuf), "each callback error: %s", err ? err : "(non-string error)");
-            lua_pop(L, 1);      // 错误
-            lua_pop(L, 1);      // value
-            return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "%s", errBuf);
+            // The error object stays on top; Lua unwinds this C frame.
+            lua_error(L);
         }
         lua_pop(L, 1);          // value
     }
@@ -337,13 +327,7 @@ int LuaBridge_EachTable(lua_State* L, int tblIdx, int fnIdx)
             lua_pushvalue(L, -4);   // key
             if (lua_pcall(L, 2, 0, 0) != LUA_OK)
             {
-                const char* err = lua_tostring(L, -1);
-                char errBuf[512];
-                snprintf(errBuf, sizeof(errBuf), "each callback error: %s", err ? err : "(non-string error)");
-                lua_pop(L, 1);      // 错误
-                lua_pop(L, 1);      // value
-                lua_pop(L, 1);      // key
-                return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "%s", errBuf);
+                return lua_error(L);
             }
         }
 

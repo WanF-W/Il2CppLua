@@ -76,6 +76,9 @@ public:
 
     // 发送日志帧（Lua print 输出/返回值回显）
     bool SendLog(const char* text);
+    uint64_t GetRejectedLogBatches() const { return m_rejectedLogBatches.load(std::memory_order_relaxed); }
+    uint64_t GetDiscardedLogFrames() const { return m_discardedLogFrames.load(std::memory_order_relaxed); }
+    uint64_t GetDroppedLogBytes() const { return m_droppedLogBytes.load(std::memory_order_relaxed); }
 
     // 发送错误帧（命令执行失败）
     bool SendError(protocol::ErrorCategory category, int32_t line, const char* text);
@@ -133,7 +136,7 @@ private:
     void MarkDisconnected(HANDLE pipe);
     void LogWorker();
     void StopLogWorker();
-    void FlushLogs();
+    bool FlushLogs();
 
     // ---- 成员变量 ----
     HANDLE       m_pipe       = INVALID_HANDLE_VALUE; // 命名管道句柄（重叠模式）
@@ -155,6 +158,12 @@ private:
     bool         m_logStopping = false;
     bool         m_logWriting = false;
     size_t       m_logQueueBytes = 0;
+    uint64_t m_logAccepted = 0;
+    uint64_t m_logCompleted = 0;
+    bool m_logFailed = false;
+    std::atomic<uint64_t> m_rejectedLogBatches{0};
+    std::atomic<uint64_t> m_discardedLogFrames{0};
+    std::atomic<uint64_t> m_droppedLogBytes{0};
     std::atomic<bool> m_stopping{false};
     std::atomic<void*> m_pipeForCancel{nullptr};
 };

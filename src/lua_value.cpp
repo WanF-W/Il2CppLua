@@ -139,9 +139,7 @@ int32_t LuaBridge_GetEffectiveTypeEnum(const Il2CppType* type)
     }
 
     if (typeEnum != Il2CppTypeEnum::TYPE_VALUETYPE
-        && typeEnum != Il2CppTypeEnum::TYPE_GENERICINST
-        && typeEnum != Il2CppTypeEnum::TYPE_VAR
-        && typeEnum != Il2CppTypeEnum::TYPE_MVAR)
+        && typeEnum != Il2CppTypeEnum::TYPE_GENERICINST)
     {
         return typeEnum;
     }
@@ -219,7 +217,7 @@ void LuaBridge_PushString(lua_State* L, Il2CppString* str)
 int LuaBridge_ScoreArg(lua_State* L, int idx, const Il2CppType* type)
 {
     auto& resolver = Il2CppResolver::Instance();
-    if (type == nullptr || resolver.IsByRef(type)) return -1;
+    if (!resolver.CanMarshalType(type)) return -1;
     const int kind = LuaBridge_GetEffectiveTypeEnum(type);
     const int luaKind = lua_type(L, idx);
     if (kind == Il2CppTypeEnum::TYPE_BOOLEAN) return luaKind == LUA_TBOOLEAN ? 3 : -1;
@@ -249,8 +247,30 @@ int LuaBridge_ScoreArg(lua_State* L, int idx, const Il2CppType* type)
     if (!IsIntegerType(kind) && kind != Il2CppTypeEnum::TYPE_CHAR
         && kind != Il2CppTypeEnum::TYPE_ENUM && !pointer) return -1;
     int exact = 0;
-    lua_tointegerx(L, idx, &exact);
+    const lua_Integer value = lua_tointegerx(L, idx, &exact);
     if (!exact) return -1;
+    int rangeKind = kind;
+    if (kind == Il2CppTypeEnum::TYPE_ENUM)
+    {
+        const auto* field = resolver.GetField(resolver.GetClassFromType(type), "value__");
+        const auto* underlying = resolver.GetFieldType(field);
+        if (underlying == nullptr) return -1;
+        rangeKind = resolver.GetTypeEnum(underlying);
+        if (!IsIntegerType(rangeKind)) return -1;
+    }
+    // UInt64/UIntPtr use the complete Lua integer bit pattern on Windows x64.
+    // Narrow types instead require an exactly representable target value.
+    switch (rangeKind)
+    {
+    case Il2CppTypeEnum::TYPE_I1: if (value < INT8_MIN || value > INT8_MAX) return -1; break;
+    case Il2CppTypeEnum::TYPE_I2: if (value < INT16_MIN || value > INT16_MAX) return -1; break;
+    case Il2CppTypeEnum::TYPE_I4: if (value < INT32_MIN || value > INT32_MAX) return -1; break;
+    case Il2CppTypeEnum::TYPE_U1: if (value < 0 || value > UINT8_MAX) return -1; break;
+    case Il2CppTypeEnum::TYPE_CHAR:
+    case Il2CppTypeEnum::TYPE_U2: if (value < 0 || value > UINT16_MAX) return -1; break;
+    case Il2CppTypeEnum::TYPE_U4: if (value < 0 || static_cast<uint64_t>(value) > UINT32_MAX) return -1; break;
+    default: break;
+    }
     if (!lua_isinteger(L, idx)) return 1; // 1.0 可精确转整数，但优先匹配浮点重载。
     return kind == Il2CppTypeEnum::TYPE_I4 || kind == Il2CppTypeEnum::TYPE_U4 ? 3 : 2;
 }
@@ -528,6 +548,8 @@ void* LuaBridge_NewBuffer(lua_State* L, size_t size)
 // C# 返回值 → Lua 值
 int LuaBridge_PushReturnValue(lua_State* L, Il2CppObject* result, const Il2CppType* returnType)
 {
+    if (!Il2CppResolver::Instance().CanMarshalType(returnType))
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "unsupported return type (open type or Nullable)");
     const int kind = LuaBridge_GetEffectiveTypeEnum(returnType);
     if (returnType == nullptr || kind == Il2CppTypeEnum::TYPE_VOID) return 0;
     if (result == nullptr) { lua_pushnil(L); return 1; }
@@ -548,6 +570,7 @@ int LuaBridge_PushReturnValue(lua_State* L, Il2CppObject* result, const Il2CppTy
 int LuaBridge_PushFieldValue(lua_State* L, const Il2CppType* type, void* value)
 {
     if (L == nullptr || type == nullptr || value == nullptr) return 0;
+    if (!Il2CppResolver::Instance().CanMarshalType(type)) return 0;
 
     auto& resolver = Il2CppResolver::Instance();
     const int32_t typeEnum = LuaBridge_GetEffectiveTypeEnum(type);
@@ -631,7 +654,7 @@ size_t LuaBridge_GetValueStorageSize(const Il2CppType* fieldType)
 {
     auto& resolver = Il2CppResolver::Instance();
 
-    if (fieldType == nullptr) return 0;
+    if (!resolver.CanMarshalType(fieldType)) return 0;
     const int32_t typeEnum = LuaBridge_GetEffectiveTypeEnum(fieldType);
 
     switch (typeEnum)

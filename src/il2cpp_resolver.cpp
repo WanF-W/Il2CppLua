@@ -1,6 +1,7 @@
-// 运行时导出解析、元数据查询和 IL2CPP 原语。此层不依赖 Lua 或 UnityEngine。
+// 运行时导出解析、元数据查询和 IL2CPP 原语；只依赖 LuaEngine 的故障状态，不调用 Lua C API。
 // 导出完整性在 Init 检查；缓存名称由本层拥有，元数据地址由运行时拥有。
 #include "il2cpp_resolver.h"
+#include "lua_engine.h" // lifecycle guard only; no Lua C API in this layer
 
 #include <algorithm>
 #include <cctype>
@@ -60,6 +61,7 @@ BridgeResult Il2CppResolver::Init()
 // 关闭
 void Il2CppResolver::Shutdown()
 {
+    if (LuaEngine::Instance().IsFaulted()) return;
     // 这里只 detach Init 所在线程。Hook 回调线程的附加状态故意保持到进程
     // 结束，避免在未知回调生命周期中错误 detach；详见 README 的限制说明。
     if (m_thread_detach != nullptr && m_thread != nullptr)
@@ -75,6 +77,7 @@ void Il2CppResolver::Shutdown()
         m_assemblyCache.clear();
         m_classCache.clear();
         m_typeNames.clear();
+        m_closedClasses.clear();
     }
 
     // 清空所有函数指针（防止 Shutdown 后误调用）
@@ -674,6 +677,7 @@ void Il2CppResolver::ReadField(Il2CppObject* obj, const Il2CppField* field, void
     if (obj == nullptr || field == nullptr || outValue == nullptr || m_field_get_value == nullptr) return;
     // il2cpp_field_get_value 内部根据字段类型大小进行内存复制
     m_field_get_value(obj, field, outValue);
+    LuaEngine::Instance().RequireHealthy();
 }
 
 // 写入实例字段值
@@ -681,6 +685,7 @@ void Il2CppResolver::WriteField(Il2CppObject* obj, const Il2CppField* field, voi
 {
     if (obj == nullptr || field == nullptr || m_field_set_value == nullptr) return;
     m_field_set_value(obj, field, value);
+    LuaEngine::Instance().RequireHealthy();
 }
 
 // 读取静态字段值
@@ -689,6 +694,7 @@ void Il2CppResolver::ReadStaticField(const Il2CppField* field, void* outValue) c
 {
     if (field == nullptr || outValue == nullptr || m_field_static_get_value == nullptr) return;
     m_field_static_get_value(field, outValue);
+    LuaEngine::Instance().RequireHealthy();
 }
 
 // 写入静态字段值
@@ -696,14 +702,17 @@ void Il2CppResolver::WriteStaticField(const Il2CppField* field, void* value) con
 {
     if (field == nullptr || m_field_static_set_value == nullptr) return;
     m_field_static_set_value(field, value);
+    LuaEngine::Instance().RequireHealthy();
 }
 // 运行时调用
 // 返回的指针对象已初始化 klass 头部 但字段值未初始化
 // 如需完整构造 应通过 RuntimeInvoke 调用 .ctor 方法
 Il2CppObject* Il2CppResolver::ObjectNew(Il2CppClass* klass) const
 {
-    if (klass == nullptr || m_object_new == nullptr) return nullptr;
-    return m_object_new(klass);
+    if (m_object_new == nullptr || !CanUseClass(klass)) return nullptr;
+    auto* result = m_object_new(klass);
+    LuaEngine::Instance().RequireHealthy();
+    return result;
 }
 
 // 通过 runtime_invoke 调用方法 这是 IL2CPP 提供的安全调用方式
@@ -723,13 +732,14 @@ Il2CppObject* Il2CppResolver::ObjectNew(Il2CppClass* klass) const
 // void 方法返回 nullptr
 Il2CppObject* Il2CppResolver::RuntimeInvoke(const Il2CppMethod* method, void* obj, void** params, Il2CppException** outExc) const
 {
-    if (method == nullptr || m_runtime_invoke == nullptr) return nullptr;
-
     // 确保 outExc 有初始值
     if (outExc != nullptr) *outExc = nullptr;
+    if (m_runtime_invoke == nullptr || !CanInvokeMethod(method)) return nullptr;
 
     // runtime_invoke 自己处理静态初始化并捕获托管异常。
-    return m_runtime_invoke(method, obj, params, outExc);
+    auto* result = m_runtime_invoke(method, obj, params, outExc);
+    LuaEngine::Instance().RequireHealthy();
+    return result;
 }
 
 // 触发类的静态构造函数
@@ -737,8 +747,9 @@ Il2CppObject* Il2CppResolver::RuntimeInvoke(const Il2CppMethod* method, void* ob
 // 调用此方法确保静态构造函数已执行
 void Il2CppResolver::RuntimeClassInit(Il2CppClass* klass) const
 {
-    if (klass == nullptr || m_runtime_class_init == nullptr) return;
+    if (m_runtime_class_init == nullptr || !CanUseClass(klass)) return;
     m_runtime_class_init(klass);
+    LuaEngine::Instance().RequireHealthy();
 }
 // 字符串操作
 // 从指定长度的字节创建托管字符串（可包含嵌入的 null）
@@ -746,7 +757,9 @@ Il2CppString* Il2CppResolver::StringNewLen(const char* str, uint32_t len) const
 {
     if (str == nullptr) return nullptr;
 
-    return m_string_new_len != nullptr ? m_string_new_len(str, len) : nullptr;
+    auto* result = m_string_new_len != nullptr ? m_string_new_len(str, len) : nullptr;
+    LuaEngine::Instance().RequireHealthy();
+    return result;
 }
 
 // 获取字符串的 UTF-16 字符数组指针
@@ -773,6 +786,7 @@ Il2CppString* Il2CppResolver::ObjectToString(Il2CppObject* object) const
     if (m_object_to_string != nullptr)
     {
         Il2CppString* result = m_object_to_string(object);
+        LuaEngine::Instance().RequireHealthy();
         if (result != nullptr) return result;
     }
 
@@ -796,8 +810,10 @@ Il2CppString* Il2CppResolver::ObjectToString(Il2CppObject* object) const
 // 返回装箱后的 Il2CppObject*
 Il2CppObject* Il2CppResolver::Box(Il2CppClass* klass, void* data) const
 {
-    if (klass == nullptr || data == nullptr || m_value_box == nullptr) return nullptr;
-    return m_value_box(klass, data);
+    if (data == nullptr || m_value_box == nullptr || !CanUseClass(klass)) return nullptr;
+    auto* result = m_value_box(klass, data);
+    LuaEngine::Instance().RequireHealthy();
+    return result;
 }
 
 // 拆箱：获取托管对象内部的值类型数据指针
@@ -870,8 +886,10 @@ Il2CppObject* Il2CppResolver::GetTypeObject(const Il2CppType* type) const
 // 返回 Il2CppArray* 指针
 Il2CppArray* Il2CppResolver::ArrayNew(Il2CppClass* elementClass, uint32_t length) const
 {
-    if (elementClass == nullptr || m_array_new == nullptr) return nullptr;
-    return m_array_new(elementClass, length);
+    if (m_array_new == nullptr || !CanUseClass(elementClass)) return nullptr;
+    auto* result = m_array_new(elementClass, length);
+    LuaEngine::Instance().RequireHealthy();
+    return result;
 }
 
 // 读取数组长度
@@ -896,6 +914,18 @@ bool Il2CppResolver::ArraySetReference(
 // 遍历类的所有方法 写入 outList 数组
 // 返回实际写入的方法数量
 // 使用 class_get_methods 的迭代器模式逐个获取
+const Il2CppMethod* Il2CppResolver::NextMethod(Il2CppClass* klass, void*& iterator) const
+{
+    return klass != nullptr && m_class_get_methods != nullptr
+        ? m_class_get_methods(klass, &iterator) : nullptr;
+}
+
+const Il2CppField* Il2CppResolver::NextField(Il2CppClass* klass, void*& iterator) const
+{
+    return klass != nullptr && m_class_get_fields != nullptr
+        ? m_class_get_fields(klass, &iterator) : nullptr;
+}
+
 int32_t Il2CppResolver::EnumerateMethods(Il2CppClass* klass, const Il2CppMethod** outList, int32_t maxCount) const
 {
     if (klass == nullptr || outList == nullptr || maxCount <= 0 || m_class_get_methods == nullptr) return 0;
@@ -937,6 +967,97 @@ int32_t Il2CppResolver::EnumerateFields(Il2CppClass* klass, const Il2CppField** 
     }
 
     return count;
+}
+
+thread_local bool Il2CppResolver::s_typeQueryActive = false;
+
+bool Il2CppResolver::IsNullableClass(Il2CppClass* klass) const
+{
+    const char* name = GetClassSimpleName(klass);
+    const char* ns = GetClassNamespace(klass);
+    return name != nullptr && ns != nullptr && IsValueType(klass)
+        && strcmp(name, "Nullable`1") == 0 && strcmp(ns, "System") == 0;
+}
+
+bool Il2CppResolver::IsClosedClass(Il2CppClass* klass) const
+{
+    if (klass == nullptr) return false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto found = m_closedClasses.find(klass);
+        if (found != m_closedClasses.end()) return found->second;
+    }
+    // Do not hold a cache lock across managed reflection. A user Hook on a
+    // reflection getter must not recursively start the same classification.
+    if (s_typeQueryActive) return false;
+    s_typeQueryActive = true;
+    struct QueryGuard { bool& flag; ~QueryGuard() { flag = false; } } queryGuard{s_typeQueryActive};
+    Il2CppObject* typeObject = GetTypeObject(GetClassType(klass));
+    if (typeObject == nullptr) return false;
+    const uint32_t handle = RetainObject(typeObject);
+    if (handle == 0) return false;
+    struct HandleGuard
+    {
+        const Il2CppResolver* resolver;
+        uint32_t handle;
+        ~HandleGuard() { resolver->ReleaseObject(handle); }
+    } handleGuard{this, handle};
+    auto* reflectionClass = READ_OFFSET(typeObject, 0, Il2CppClass*)[0];
+    const auto* getter = GetMethod(reflectionClass, "get_ContainsGenericParameters");
+    if (getter == nullptr || m_runtime_invoke == nullptr || GetMethodParamCount(getter) != 0
+        || IsStaticMethod(getter) || GetTypeEnum(GetMethodReturnType(getter)) != Il2CppTypeEnum::TYPE_BOOLEAN)
+        return false;
+    Il2CppException* exception = nullptr;
+    // Bootstrap classification cannot use the guarded RuntimeInvoke wrapper.
+    Il2CppObject* result = m_runtime_invoke(getter, typeObject, nullptr, &exception);
+    LuaEngine::Instance().RequireHealthy();
+    if (exception != nullptr || result == nullptr) return false;
+    const auto* value = static_cast<const bool*>(Unbox(result));
+    if (value == nullptr) return false;
+    const bool closed = !*value;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_closedClasses.emplace(klass, closed);
+    }
+    return closed;
+}
+
+bool Il2CppResolver::CanUseClass(Il2CppClass* klass) const
+{
+    return klass != nullptr && !IsNullableClass(klass) && IsClosedClass(klass);
+}
+
+bool Il2CppResolver::CanMarshalType(const Il2CppType* type) const
+{
+    if (type == nullptr || IsByRef(type)) return false;
+    switch (GetTypeEnum(type))
+    {
+    case Il2CppTypeEnum::TYPE_VAR:
+    case Il2CppTypeEnum::TYPE_MVAR:
+        return false;
+    case Il2CppTypeEnum::TYPE_VALUETYPE:
+    case Il2CppTypeEnum::TYPE_GENERICINST:
+    case Il2CppTypeEnum::TYPE_CLASS:
+    case Il2CppTypeEnum::TYPE_OBJECT:
+    case Il2CppTypeEnum::TYPE_ARRAY:
+    case Il2CppTypeEnum::TYPE_SZARRAY:
+    case Il2CppTypeEnum::TYPE_PTR:
+        return CanUseClass(GetClassFromType(type));
+    default:
+        return true; // Actual storage/ABI support is checked by the value layer.
+    }
+}
+
+bool Il2CppResolver::CanInvokeMethod(const Il2CppMethod* method) const
+{
+    if (method == nullptr || !CanUseClass(GetMethodClass(method))
+        || (IsGenericMethod(method) && !IsInflatedMethod(method))
+        || !CanMarshalType(GetMethodReturnType(method))) return false;
+    const int count = GetMethodParamCount(method);
+    if (count < 0) return false;
+    for (int i = 0; i < count; ++i)
+        if (!CanMarshalType(GetMethodParamType(method, i))) return false;
+    return true;
 }
 
 bool Il2CppResolver::IsByRef(const Il2CppType* type) const

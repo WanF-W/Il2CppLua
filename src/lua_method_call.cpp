@@ -11,16 +11,15 @@ const Il2CppMethod* LuaBridge_ResolveMethodOverload(
     const bool constructor = std::strcmp(name, ".ctor") == 0;
     for (auto* current = klass; current != nullptr; current = resolver.GetClassParent(current))
     {
-        const Il2CppMethod* methods[1024];
-        const int methodCount = resolver.EnumerateMethods(current, methods, 1024);
+        void* iterator = nullptr;
         const Il2CppMethod* best = nullptr;
         int bestScore = -1;
-        for (int i = 0; i < methodCount; ++i)
+        while (const auto* method = resolver.NextMethod(current, iterator))
         {
-            const auto* method = methods[i];
             if (std::strcmp(resolver.GetMethodName(method), name) != 0
                 || resolver.GetMethodParamCount(method) != count
                 || (staticOnly && !resolver.IsStaticMethod(method))) continue;
+            if (!resolver.CanInvokeMethod(method)) continue;
             int score = 0;
             for (int arg = 0; arg < count; ++arg)
             {
@@ -39,8 +38,9 @@ const Il2CppMethod* LuaBridge_ResolveMethodOverload(
 int LuaBridge_InvokeMethod(lua_State* L, const Il2CppMethod* method, void* obj, int argStartIdx)
 {
     auto& resolver = Il2CppResolver::Instance();
-    if (resolver.IsGenericMethod(method) && !resolver.IsInflatedMethod(method))
-        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "open generic methods cannot be invoked");
+    if (!resolver.CanInvokeMethod(method))
+        return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp,
+            "method requires closed, supported types (Nullable/ref/open or unavailable type information)");
     const int top = lua_gettop(L);
     const int count = resolver.GetMethodParamCount(method);
     if (!lua_checkstack(L, count * 2 + 8)) return LuaEngine::RaiseError(L, protocol::ErrorCategory::Il2Cpp, "Lua stack capacity exceeded");

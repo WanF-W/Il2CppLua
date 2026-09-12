@@ -19,7 +19,7 @@
  *
  * ·IL2CPP 函数调用可能引发访问违规 (0xC0000005)
  * ·所有 Lua 代码执行都包裹在 __try/__except 中
- * ·捕获异常后恢复栈并报告错误 避免 DLL 崩溃
+ * ·原生故障后隔离整个会话，不再访问或关闭受损 VM；嵌套故障传至最外层入口
  *
  * 仅针对 Windows x64
  */
@@ -55,6 +55,7 @@ public:
         OutputCapture* previous = nullptr;
         std::string text;
         bool active = false;
+        bool truncated = false;
         friend class LuaEngine;
     };
 
@@ -82,7 +83,14 @@ public:
     void Shutdown();
 
     // 访问初始化状态
-    bool IsInitialized() const { return m_initialized.load(std::memory_order_acquire); }
+    bool IsInitialized() const { return !IsFaulted() && m_initialized.load(std::memory_order_acquire); }
+    bool IsFaulted() const { return m_faultCode.load(std::memory_order_acquire) != 0; }
+    // No Lua API or allocation in the native exception filter.
+    void Quarantine(unsigned long exceptionCode);
+    static bool EnterExecution(); // returns whether an outer execution exists
+    static void LeaveExecution();
+    static bool IsExecuting();
+    void RequireHealthy() const;
 
     /**
      * 执行一段 Lua 代码字符串
@@ -91,6 +99,7 @@ public:
      * @return true 执行成功 false 失败
      */
     bool ExecuteString(const char* code);
+    bool ExecuteString(const char* code, size_t length);
 
     /**
      * 执行一个 Lua 文件
@@ -99,6 +108,7 @@ public:
      * @return true 执行成功 false 失败
      */
     bool ExecuteFile(const char* path);
+    bool ExecuteFile(const char* path, size_t length);
 
     // 获取最近一次执行失败的结构化错误。错误文本不包含 Lua source name，
     // 行号单独传输给协议层，避免 CLI 显示 [string "<string>"]。
@@ -115,7 +125,7 @@ public:
     // 获取 Lua 状态机指针
     // 返回状态机指针。调用方若要使用 Lua C API，必须同时持有 GetMutex()；
     // 指针本身不拥有 Lua 状态机的生命周期。
-    lua_State* GetState() const { return m_L.load(std::memory_order_acquire); }
+    lua_State* GetState() const { return IsFaulted() ? nullptr : m_L.load(std::memory_order_acquire); }
 
     // 获取互斥锁（可重入）
     // Hook 回调可能在同一线程内递归触发（回调内调用被 Hook 的方法）
@@ -138,6 +148,8 @@ private:
 
     // includeLine 只对 Lua 文件执行启用；交互字符串错误不向 Lune 暴露行号。
     bool ExecuteBuffer(const char* buff, size_t size, const char* name, bool includeLine);
+    bool ExecuteBufferCore(const char* buff, size_t size, const char* name, bool includeLine);
+    bool ExecuteBufferProtected(const char* buff, size_t size, const char* name, bool includeLine);
 
     void SetLastError(protocol::ErrorCategory category, int32_t line, const char* message);
 
@@ -150,6 +162,7 @@ private:
     // 成员变量
     std::atomic<lua_State*> m_L{nullptr};
     std::atomic<bool>       m_initialized{false};
+    std::atomic<unsigned long> m_faultCode{0}; // sticky: never reset/reuse this session
     OutputCallback m_outputCb;
     mutable std::recursive_mutex m_luaMutex;
     ExecutionError m_lastError;
